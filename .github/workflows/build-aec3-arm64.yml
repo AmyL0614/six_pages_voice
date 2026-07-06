@@ -3,12 +3,13 @@
 # Builds the WebRTC AudioProcessing module (contains AEC3) as a static
 # library for Android arm64-v8a, from a pinned upstream commit.
 #
-# Stage 1: prove it builds. Meson fetches Abseil on the runner and
-# verifies it against the SHA-256 hashes baked into the wrap file.
+# SEALED build: builds entirely from the vendored source committed in
+# this repo (third_party/webrtc-audio-processing), with network fetching
+# forbidden (--wrap-mode=nodownload). Depends on NO external server.
 #
 # Trigger: run it by hand from the Actions tab (workflow_dispatch).
 
-name: Build AEC3 arm64
+name: Build AEC3 arm64 (sealed, offline)
 
 on:
   workflow_dispatch:        # a "Run workflow" button in the Actions tab
@@ -25,6 +26,9 @@ jobs:
       ANDROID_API: "28"
 
     steps:
+      - name: Check out this repo (brings the vendored source)
+        uses: actions/checkout@v4
+
       - name: Install Meson and Ninja
         run: |
           pip install --upgrade meson ninja
@@ -37,12 +41,11 @@ jobs:
         with:
           ndk-version: r27
 
-      - name: Fetch the pinned WebRTC audio-processing source
+      - name: Use the VENDORED source (no clone, no network)
         run: |
-          git clone "$WAP_REPO" wap
-          cd wap
-          git checkout "$WAP_COMMIT"
-          git rev-parse HEAD    # print it so the log proves what we built
+          cp -r third_party/webrtc-audio-processing wap
+          echo "----- building from vendored tree; packagecache present: -----"
+          ls -la wap/subprojects/packagecache/
 
       - name: Write a Linux cross-file for arm64
         run: |
@@ -81,6 +84,7 @@ jobs:
             --cross-file cross_linux_aarch64.ini \
             --default-library=static \
             --buildtype=release \
+            --wrap-mode=nodownload \
             -Dprefix=$PWD/install/arm64
           meson compile -C build_arm64
           meson install -C build_arm64
