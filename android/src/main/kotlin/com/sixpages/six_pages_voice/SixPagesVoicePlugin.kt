@@ -8,8 +8,6 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -22,13 +20,22 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 
 /**
- * SixPagesVoicePlugin — CAPTURE + PLAYBACK + SPEAKER ROUTING + EXPLICIT AEC.
+ * SixPagesVoicePlugin — CAPTURE + PLAYBACK + SPEAKER ROUTING + WebRTC AEC3.
  *
- * Owns mic capture and Joe's playback through the OS voice-communication path,
- * with an AcousticEchoCanceler (and NoiseSuppressor) bound explicitly to the
- * AudioRecord session so echo cancellation is deterministic and ours. The AEC
- * is created AFTER the AudioRecord exists and BEFORE it starts recording, and
- * logs whether it engaged (tag SixPagesVoice) — check logcat to confirm.
+ * Owns mic capture and Joe's playback through the OS voice-communication path.
+ * Echo cancellation is done by WebRTC's AEC3 (software), via the native shim
+ * (libsix_pages_voice_aec3.so), NOT by the Android hardware AcousticEchoCanceler
+ * — that hardware unit reported enabled=true on the SM-S928U but did not
+ * actually cancel (proven by ElevenLabs transcripts). AEC3 needs BOTH sides:
+ *   - the render reference: Joe's playback PCM, fed via nativeProcessRender()
+ *     BEFORE it is written to the AudioTrack (feedPlayback()).
+ *   - the capture stream: the mic PCM, cleaned in place via nativeProcessCapture()
+ *     on the capture thread BEFORE each frame is posted to Dart.
+ * Without the render reference, AEC3 has nothing to subtract and cannot cancel.
+ *
+ * Frame contract: PCM16 / 16 kHz / mono, 640-byte (20 ms) frames. The shim
+ * splits each 20 ms frame into two 10 ms halves internally (AEC3 processes 10 ms
+ * chunks); that is invisible here.
  *
  * Contract:
  *   MethodChannel  six_pages_voice/control  — start() -> Bool, stop(), feedPlayback(Uint8List)
@@ -41,6 +48,30 @@ class SixPagesVoicePlugin :
 
     private val tag = "SixPagesVoice"
 
+    // --- Native AEC3 bridge -------------------------------------------------
+    //
+    // These are INSTANCE external functions (the JNI symbols in aec3_shim.cpp
+    // take jobject thiz, i.e. Java_..._SixPagesVoicePlugin_nativeCreate(env, thiz,
+    // ...)). They must NOT live in the companion object, or the generated symbol
+    // names would be ..._Companion_native... and fail to bind.
+    private external fun nativeCreate(): Long
+    private external fun nativeProcessRender(handle: Long, frame: ByteArray)
+    private external fun nativeProcessCapture(handle: Long, frame: ByteArray)
+    private external fun nativeDestroy(handle: Long)
+
+    companion object {
+        init {
+            System.loadLibrary("six_pages_voice_aec3")
+        }
+    }
+
+    // AEC3 engine handle (opaque native pointer). 0 == no engine.
+    @Volatile private var aecHandle: Long = 0L
+    // Guards create/destroy against feedPlayback's render calls. The capture
+    // thread is fenced separately by the join() in stopCapture(), so the only
+    // cross-thread race left is feedPlayback (render) vs stopCapture (destroy).
+    private val aecLock = Any()
+
     private lateinit var controlChannel: MethodChannel
     private lateinit var captureChannel: EventChannel
     private var appContext: Context? = null
@@ -51,9 +82,6 @@ class SixPagesVoicePlugin :
     private var audioRecord: AudioRecord? = null
     private var captureThread: Thread? = null
     @Volatile private var capturing = false
-
-    private var echoCanceler: AcousticEchoCanceler? = null
-    private var noiseSuppressor: NoiseSuppressor? = null
 
     private var audioTrack: AudioTrack? = null
 
@@ -87,6 +115,17 @@ class SixPagesVoicePlugin :
             "feedPlayback" -> {
                 val pcm = call.arguments as? ByteArray
                 if (pcm != null) {
+                    // Feed Joe's playback to AEC3 as the far-end reference
+                    // BEFORE it hits the speaker, then play it. Order matters:
+                    // AEC3 must see the reference at least as early as the echo
+                    // arrives at the mic. Held under aecLock so a concurrent
+                    // stop()/destroy cannot free the handle mid-call.
+                    synchronized(aecLock) {
+                        val h = aecHandle
+                        if (h != 0L) {
+                            nativeProcessRender(h, pcm)
+                        }
+                    }
                     audioTrack?.write(pcm, 0, pcm.size)
                 }
                 result.success(null)
@@ -209,7 +248,7 @@ class SixPagesVoicePlugin :
         audioTrack = null
     }
 
-    // --- Capture + explicit AEC ---
+    // --- Capture + WebRTC AEC3 ---
 
     private fun startCapture(): Boolean {
         if (capturing) return true
@@ -228,28 +267,18 @@ class SixPagesVoicePlugin :
             return false
         }
 
-        // Bind explicit AEC + NoiseSuppressor to THIS record's session,
-        // after it exists and before it starts recording.
-        val sessionId = record.audioSessionId
-        if (AcousticEchoCanceler.isAvailable()) {
-            val aec = AcousticEchoCanceler.create(sessionId)
-            if (aec != null) {
-                aec.enabled = true
-                echoCanceler = aec
-                Log.i(tag, "AEC created and enabled=${aec.enabled} on session $sessionId")
-            } else {
-                Log.w(tag, "AEC.create returned null on session $sessionId")
-            }
-        } else {
-            Log.w(tag, "AEC not available on this device")
-        }
-
-        if (NoiseSuppressor.isAvailable()) {
-            val ns = NoiseSuppressor.create(sessionId)
-            if (ns != null) {
-                ns.enabled = true
-                noiseSuppressor = ns
-                Log.i(tag, "NoiseSuppressor created and enabled=${ns.enabled}")
+        // Create the AEC3 engine. We do NOT bind the Android hardware
+        // AcousticEchoCanceler/NoiseSuppressor — AEC3 replaces both. Noise
+        // suppression is enabled inside the shim's APM config.
+        synchronized(aecLock) {
+            if (aecHandle == 0L) {
+                val h = nativeCreate()
+                aecHandle = h
+                if (h == 0L) {
+                    Log.w(tag, "nativeCreate() returned 0 — AEC3 engine not created; capture will be UNCANCELLED")
+                } else {
+                    Log.i(tag, "AEC3 engine created (handle set)")
+                }
             }
         }
 
@@ -263,6 +292,16 @@ class SixPagesVoicePlugin :
                 val read = record.read(buf, 0, buf.size)
                 if (read > 0) {
                     val frame = if (read == buf.size) buf.copyOf() else buf.copyOf(read)
+                    // Clean this frame in place via AEC3 before sending it on.
+                    // The capture thread is the ONLY caller of nativeProcessCapture,
+                    // and stopCapture() join()s this thread before destroying the
+                    // handle, so reading aecHandle here without the lock is safe
+                    // against destroy. (feedPlayback/render is a separate path,
+                    // which AEC3's threading model permits concurrently.)
+                    val h = aecHandle
+                    if (h != 0L) {
+                        nativeProcessCapture(h, frame)
+                    }
                     mainHandler.post { eventSink?.success(frame) }
                 }
             }
@@ -282,16 +321,17 @@ class SixPagesVoicePlugin :
         }
         captureThread = null
 
-        echoCanceler?.let {
-            try { it.enabled = false } catch (_: Exception) {}
-            it.release()
+        // Capture thread is now joined (no more nativeProcessCapture calls).
+        // Destroy the AEC3 engine under the lock so any in-flight feedPlayback
+        // render call finishes first and no new one starts on a freed handle.
+        synchronized(aecLock) {
+            val h = aecHandle
+            aecHandle = 0L
+            if (h != 0L) {
+                nativeDestroy(h)
+                Log.i(tag, "AEC3 engine destroyed")
+            }
         }
-        echoCanceler = null
-        noiseSuppressor?.let {
-            try { it.enabled = false } catch (_: Exception) {}
-            it.release()
-        }
-        noiseSuppressor = null
 
         audioRecord?.let {
             try {
