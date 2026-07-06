@@ -1,0 +1,99 @@
+# .github/workflows/diag-archive-members.yml
+#
+# DIAGNOSTIC ONLY. Builds the APM from vendored source, then for the archive
+# that has been failing conversion (libwebrtc-audio-coding-1.a) it prints:
+#   - the raw `ar t` member listing (exact stored paths)
+#   - for each member, whether it exists relative to the build root, relative
+#     to the archive's own directory, or as a bare find on disk
+# No conversion, no commit. Purely to read the wire so we fix precisely.
+
+name: Diag archive members (arm64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_API: "28"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Meson and Ninja
+        run: pip install --upgrade meson ninja
+
+      - name: Set up the Android NDK (r27)
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27
+
+      - name: Build the WebRTC APM from vendored source (sealed, offline)
+        run: |
+          cp -r third_party/webrtc-audio-processing wap
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          cat > wap/cross_linux_aarch64.ini <<EOF
+          [constants]
+          ndk_path    = '${NDK}'
+          bin         = ndk_path + '/toolchains/llvm/prebuilt/linux-x86_64/bin/'
+          toolchain   = bin + 'aarch64-linux-android'
+          api         = '${ANDROID_API}'
+
+          [host_machine]
+          system      = 'android'
+          cpu_family  = 'aarch64'
+          cpu         = 'aarch64'
+          endian      = 'little'
+
+          [properties]
+          sys_root        = ndk_path + '/sysroot'
+          c_link_args     = ['-fuse-ld=lld', '-Wl,-z,max-page-size=16384', '-Wl,-z,common-page-size=16384']
+          cpp_link_args   = ['-fuse-ld=lld', '-Wl,-z,max-page-size=16384', '-Wl,-z,common-page-size=16384']
+
+          [binaries]
+          c           = toolchain + api + '-clang'
+          cpp         = toolchain + api + '-clang++'
+          ar          = bin + 'llvm-ar'
+          strip       = toolchain + '-strip'
+          EOF
+          cd wap
+          meson setup build_arm64 \
+            --cross-file cross_linux_aarch64.ini \
+            --default-library=static \
+            --buildtype=release \
+            --wrap-mode=nodownload \
+            -Dprefix=$PWD/install/arm64
+          meson compile -C build_arm64
+          meson install -C build_arm64
+
+      - name: Dump member paths + resolution for the failing archive
+        run: |
+          cd wap
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          AR="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          A="build_arm64/webrtc/modules/audio_coding/libwebrtc-audio-coding-1.a"
+          DIR=$(dirname "$A")
+
+          echo "########## header (thin?) ##########"
+          head -c 7 "$A"; echo
+          echo "########## raw 'ar t' from build root ##########"
+          "$AR" t "$A"
+          echo "########## raw 'ar t' from archive dir ##########"
+          ( cd "$DIR" && "$AR" t "$(basename "$A")" )
+
+          echo "########## per-member resolution test ##########"
+          "$AR" t "$A" | while IFS= read -r m; do
+            froot="MISS"; fdir="MISS"; fdisk="MISS"
+            [ -f "build_arm64/$m" ] && froot="OK"
+            [ -f "$DIR/$m" ] && fdir="OK"
+            hit=$(find build_arm64 -name "$(basename "$m")" | head -1)
+            [ -n "$hit" ] && fdisk="$hit"
+            printf 'member=%-60s root=%s archdir=%s ondisk=%s\n' "$m" "$froot" "$fdir" "$fdisk"
+          done
+
+          echo "########## is 'checks.cc.o' actually present anywhere? ##########"
+          find build_arm64 -name 'checks.cc.o' | sort
+          echo "########## how many distinct basenames vs how many members ##########"
+          echo "members: $("$AR" t "$A" | wc -l)"
+          echo "distinct basenames: $("$AR" t "$A" | xargs -n1 basename | sort -u | wc -l)"
