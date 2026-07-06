@@ -3,6 +3,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:six_pages_voice/six_pages_voice.dart';
 
@@ -29,6 +30,9 @@ class CaptureTestPage extends StatefulWidget {
 class _CaptureTestPageState extends State<CaptureTestPage> {
   final _voice = SixPagesVoice();
 
+  // Direct channel for the TEST-ONLY loud playback (not in the public contract).
+  static const _control = MethodChannel('six_pages_voice/control');
+
   String _status = 'Idle';
   bool _running = false;
   double _rms = 0.0;
@@ -37,7 +41,6 @@ class _CaptureTestPageState extends State<CaptureTestPage> {
   int _totalBytes = 0;
 
   Stream<Uint8List>? _stream;
-  // Keep a reference so we can cancel on stop.
   StreamSubscription<Uint8List>? _sub;
 
   Future<void> _start() async {
@@ -48,10 +51,10 @@ class _CaptureTestPageState extends State<CaptureTestPage> {
       return;
     }
 
-    setState(() => _status = 'Starting capture...');
+    setState(() => _status = 'Starting engine...');
     final ok = await _voice.start();
     if (!ok) {
-      setState(() => _status = 'start() returned false — capture did NOT open');
+      setState(() => _status = 'start() returned false — engine did NOT open');
       return;
     }
 
@@ -68,7 +71,7 @@ class _CaptureTestPageState extends State<CaptureTestPage> {
           if (rms > _peakRms) _peakRms = rms;
           _frameCount++;
           _totalBytes += frame.length;
-          _status = 'Capturing';
+          _status = 'Running';
         });
       },
       onError: (e) {
@@ -78,7 +81,7 @@ class _CaptureTestPageState extends State<CaptureTestPage> {
 
     setState(() {
       _running = true;
-      _status = 'Capturing';
+      _status = 'Running';
     });
   }
 
@@ -93,7 +96,58 @@ class _CaptureTestPageState extends State<CaptureTestPage> {
     });
   }
 
-  // RMS energy of a PCM16 little-endian frame, normalized to 0..1.
+  void _resetPeak() {
+    setState(() => _peakRms = 0.0);
+  }
+
+  Uint8List _makeTone() {
+    const freq = 440.0;
+    const durationSeconds = 1.0;
+    const amplitude = 0.9;
+    final sampleCount = (16000 * durationSeconds).toInt();
+    final bytes = Uint8List(sampleCount * 2);
+    final data = ByteData.sublistView(bytes);
+    for (int i = 0; i < sampleCount; i++) {
+      final t = i / 16000.0;
+      final sample = (sin(2 * pi * freq * t) * amplitude * 32767).toInt();
+      data.setInt16(i * 2, sample, Endian.little);
+    }
+    return bytes;
+  }
+
+  // Comms path (the real path Joe will use).
+  Future<void> _playToneComms() async {
+    if (!_running) {
+      setState(() => _status = 'Press Start first');
+      return;
+    }
+    final bytes = _makeTone();
+    const chunkBytes = 640;
+    for (int offset = 0; offset < bytes.length; offset += chunkBytes) {
+      final end = min(offset + chunkBytes, bytes.length);
+      await _voice.feedPlayback(Uint8List.sublistView(bytes, offset, end));
+    }
+    setState(() => _status = 'Comms tone fed');
+  }
+
+  // LOUD media path — TEST BASELINE ONLY. Should make the mic hear it.
+  Future<void> _playToneLoud() async {
+    if (!_running) {
+      setState(() => _status = 'Press Start first');
+      return;
+    }
+    final bytes = _makeTone();
+    const chunkBytes = 640;
+    for (int offset = 0; offset < bytes.length; offset += chunkBytes) {
+      final end = min(offset + chunkBytes, bytes.length);
+      await _control.invokeMethod<void>(
+        'feedPlaybackLoud',
+        Uint8List.sublistView(bytes, offset, end),
+      );
+    }
+    setState(() => _status = 'LOUD tone fed');
+  }
+
   double _computeRms(Uint8List frame) {
     if (frame.length < 2) return 0.0;
     final data = ByteData.sublistView(frame);
@@ -111,31 +165,50 @@ class _CaptureTestPageState extends State<CaptureTestPage> {
   Widget build(BuildContext context) {
     final rmsPct = (_rms * 100).clamp(0, 100).toDouble();
     return Scaffold(
-      appBar: AppBar(title: const Text('Six Pages Voice — Capture Test')),
-      body: Padding(
+      appBar: AppBar(title: const Text('Six Pages Voice — Baseline Echo Test')),
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text('Status: $_status', style: const TextStyle(fontSize: 16)),
-            const SizedBox(height: 24),
-            const Text('RMS energy (speak to see it jump):',
-                style: TextStyle(fontSize: 14)),
+            const SizedBox(height: 16),
+            const Text('RMS energy:', style: TextStyle(fontSize: 14)),
             const SizedBox(height: 8),
             Text(
               _rms.toStringAsFixed(4),
-              style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold),
+              style: const TextStyle(fontSize: 44, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
             LinearProgressIndicator(value: rmsPct / 100.0, minHeight: 16),
+            const SizedBox(height: 16),
+            Text('PEAK RMS this run: ${_peakRms.toStringAsFixed(4)}',
+                style: const TextStyle(
+                    fontSize: 18, fontWeight: FontWeight.bold)),
+            Text('Frames: $_frameCount   Bytes: $_totalBytes',
+                style: const TextStyle(fontSize: 13)),
+            const SizedBox(height: 16),
+            OutlinedButton(
+              onPressed: _running ? _resetPeak : null,
+              child: const Text('Reset Peak'),
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton(
+              onPressed: _running ? _playToneLoud : null,
+              child: const Padding(
+                padding: EdgeInsets.all(14),
+                child: Text('Play LOUD tone (baseline — mic should hear it)'),
+              ),
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: _running ? _playToneComms : null,
+              child: const Padding(
+                padding: EdgeInsets.all(14),
+                child: Text('Play tone (comms path)'),
+              ),
+            ),
             const SizedBox(height: 24),
-            Text('Peak RMS this run: ${_peakRms.toStringAsFixed(4)}',
-                style: const TextStyle(fontSize: 14)),
-            Text('Frames received: $_frameCount',
-                style: const TextStyle(fontSize: 14)),
-            Text('Total bytes: $_totalBytes',
-                style: const TextStyle(fontSize: 14)),
-            const Spacer(),
             Row(
               children: [
                 Expanded(
