@@ -74,7 +74,13 @@ android {
     }
 }
 
-kotlin {
+// Configure the Kotlin extension explicitly by class rather than via the
+// top-level kotlin {} block. When the Kotlin Gradle Plugin is applied
+// conditionally (above), the kotlin {} receiver is not available and causes a
+// "receiver type mismatch" error. This project.extensions.configure form works
+// whether KGP was applied conditionally or by the toolchain. (Flutter
+// plugin-author migration guide, AGP <9 and >=9 support.)
+project.extensions.configure(org.jetbrains.kotlin.gradle.dsl.KotlinAndroidProjectExtension::class.java) {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
     }
