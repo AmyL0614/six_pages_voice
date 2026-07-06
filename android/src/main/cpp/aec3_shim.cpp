@@ -38,6 +38,11 @@ constexpr int kFrame10msBytes   = kFrame10msSamples * 2;  // int16
 struct Aec3Engine {
   rtc::scoped_refptr<webrtc::AudioProcessing> apm;
   webrtc::StreamConfig stream_config{kSampleRateHz, kNumChannels};
+  // The render->capture delay AEC3 needs (ms). Set from Kotlin after create,
+  // re-asserted on every capture frame (WebRTC's own client does this each
+  // frame). 0 until Kotlin sets it; the header requires this be called when
+  // echo processing is enabled.
+  int stream_delay_ms = 0;
 };
 
 // Process one 10 ms half. is_render == true feeds the far-end reference;
@@ -79,6 +84,17 @@ Java_com_sixpages_six_1pages_1voice_SixPagesVoicePlugin_nativeCreate(
 }
 
 JNIEXPORT void JNICALL
+Java_com_sixpages_six_1pages_1voice_SixPagesVoicePlugin_nativeSetStreamDelayMs(
+    JNIEnv* /*env*/, jobject /*thiz*/, jlong handle, jint delay_ms) {
+  auto* eng = reinterpret_cast<Aec3Engine*>(handle);
+  if (eng == nullptr) return;
+  eng->stream_delay_ms = delay_ms;
+  // Apply immediately too, so it takes effect before the next capture frame.
+  eng->apm->set_stream_delay_ms(delay_ms);
+  LOGI("stream_delay_ms set to %d", delay_ms);
+}
+
+JNIEXPORT void JNICALL
 Java_com_sixpages_six_1pages_1voice_SixPagesVoicePlugin_nativeProcessRender(
     JNIEnv* env, jobject /*thiz*/, jlong handle, jbyteArray frame) {
   auto* eng = reinterpret_cast<Aec3Engine*>(handle);
@@ -109,6 +125,11 @@ Java_com_sixpages_six_1pages_1voice_SixPagesVoicePlugin_nativeProcessCapture(
   jsize len = env->GetArrayLength(frame);
   jbyte* bytes = env->GetByteArrayElements(frame, nullptr);
   auto* pcm = reinterpret_cast<int16_t*>(bytes);
+
+  // Per the header, set_stream_delay_ms must be called when echo processing is
+  // enabled. WebRTC's own client re-asserts it every capture frame; do the same
+  // so AEC3 always has the current render->capture delay to align against.
+  eng->apm->set_stream_delay_ms(eng->stream_delay_ms);
 
   int offset_samples = 0;
   int total_samples = len / 2;

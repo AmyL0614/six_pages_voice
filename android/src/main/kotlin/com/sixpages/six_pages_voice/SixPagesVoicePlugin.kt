@@ -55,6 +55,7 @@ class SixPagesVoicePlugin :
     // ...)). They must NOT live in the companion object, or the generated symbol
     // names would be ..._Companion_native... and fail to bind.
     private external fun nativeCreate(): Long
+    private external fun nativeSetStreamDelayMs(handle: Long, delayMs: Int)
     private external fun nativeProcessRender(handle: Long, frame: ByteArray)
     private external fun nativeProcessCapture(handle: Long, frame: ByteArray)
     private external fun nativeDestroy(handle: Long)
@@ -86,6 +87,14 @@ class SixPagesVoicePlugin :
     private var audioTrack: AudioTrack? = null
 
     private var savedAudioMode = AudioManager.MODE_NORMAL
+
+    // AEC3 render->capture delay hint (ms). This is the time from handing Joe's
+    // frame to ProcessReverseStream until its echo is captured by the mic and
+    // handed to ProcessStream, on the VOICE_COMMUNICATION speakerphone path.
+    // AEC3's estimator refines from this starting point; 120 ms is a typical
+    // Android speakerphone round-trip. TUNE THIS against the ElevenLabs
+    // transcript: if Joe's words still leak into user turns, adjust and rebuild.
+    private val aecStreamDelayMs = 120
 
     // Audio format — the contract: PCM16, 16 kHz, mono.
     private val sampleRate = 16000
@@ -277,7 +286,10 @@ class SixPagesVoicePlugin :
                 if (h == 0L) {
                     Log.w(tag, "nativeCreate() returned 0 — AEC3 engine not created; capture will be UNCANCELLED")
                 } else {
-                    Log.i(tag, "AEC3 engine created (handle set)")
+                    // AEC3 requires the render->capture delay when echo processing
+                    // is enabled. Set it now so the very first frames align.
+                    nativeSetStreamDelayMs(h, aecStreamDelayMs)
+                    Log.i(tag, "AEC3 engine created (handle set), stream delay = $aecStreamDelayMs ms")
                 }
             }
         }
