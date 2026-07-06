@@ -94,17 +94,7 @@ jobs:
           meson compile -C build_arm64
           meson install -C build_arm64
 
-      - name: Inventory the thin archives the build produced (proof)
-        run: |
-          cd wap
-          echo "----- every .a under build_arm64 (these are the link set) -----"
-          find build_arm64 -name '*.a' | sort
-          echo "----- confirm they are THIN (expect: !<thin>) -----"
-          for a in $(find build_arm64 -name '*.a' | sort); do
-            printf '%-70s ' "$a"; head -c 7 "$a"; echo
-          done
-
-      - name: Convert each thin archive to a real (fat) archive
+      - name: Build ONE fat archive from the real .o objects (proof-driven)
         run: |
           cd wap
           NDK="${{ steps.ndk.outputs.ndk-path }}"
@@ -114,37 +104,50 @@ jobs:
           OUT="$GITHUB_WORKSPACE/prebuilt_staging/lib"
           mkdir -p "$OUT"
 
-          # Meson stores thin-archive member paths RELATIVE TO THE BUILD ROOT
-          # (build_arm64), not relative to each archive's own directory. Some
-          # archives reference objects in SIBLING dirs (e.g. ../foo/x.o), which
-          # only resolve from the build root. So we run the conversion from
-          # inside build_arm64 for every archive, using the archive's path
-          # relative to that root. `ar t` then prints resolvable paths, and
-          # `ar rcs` finds every object. (Proven: cd-ing into dirname breaks
-          # cross-directory members like checks.cc.o.)
-          cd build_arm64
-          for a in $(find . -name '*.a' | sort); do
-            base=$(basename "$a")
-            echo "=== converting $base ($a) ==="
-            members=$("$AR" t "$a")
-            if [ -z "$members" ]; then
-              echo "!! $base has no members — aborting"; exit 1
-            fi
-            # rcs = replace, create, write index. Fresh output => fat archive.
-            "$AR" rcs "$OUT/$base" $members
-            "$RANLIB" "$OUT/$base"
-          done
-          cd ..
+          # WHY THIS APPROACH (proven by the diag workflow):
+          # Meson emits static archives whose members are stored as BARE
+          # BASENAMES with no directory (e.g. `checks.cc.o`), while the real
+          # objects live scattered across per-target `<lib>.a.p/` dirs. That
+          # makes ar-member-path reconstruction impossible — the path info is
+          # simply not in the archive. But the OBJECT FILES themselves are real
+          # files on disk. So we ignore the .a wrappers entirely and archive the
+          # actual objects. Every compiled object lives under a `*.a.p/` dir.
+          echo "----- collecting every compiled object under *.a.p/ -----"
+          find build_arm64 -type d -name '*.a.p' | sort
+          OBJS=$(find build_arm64 -type f -path '*.a.p/*.o' | sort)
+          NOBJ=$(printf '%s\n' "$OBJS" | grep -c . || true)
+          echo "object count: $NOBJ"
 
-          echo "----- staged fat archives -----"
+          # HARD ASSERTION: a single archive cannot hold two members with the
+          # same basename. Meson's flattened names (which encode the source
+          # subdir) are unique by construction; prove it, don't assume it.
+          NDISTINCT=$(printf '%s\n' "$OBJS" | xargs -n1 basename | sort -u | grep -c . || true)
+          echo "distinct basenames: $NDISTINCT"
+          if [ "$NOBJ" -ne "$NDISTINCT" ]; then
+            echo "!! basename collision: $NOBJ objects but $NDISTINCT distinct names — a single fat archive would drop objects. Aborting."
+            echo "----- the colliding basenames: -----"
+            printf '%s\n' "$OBJS" | xargs -n1 basename | sort | uniq -d
+            exit 1
+          fi
+          if [ "$NOBJ" -lt 200 ]; then
+            echo "!! only $NOBJ objects found — implausibly low, the build tree layout may have changed. Aborting."
+            exit 1
+          fi
+
+          echo "----- archiving $NOBJ objects into one fat static library -----"
+          # rcs = replace, create, write symbol index. Real objects => fat.
+          printf '%s\n' "$OBJS" | xargs "$AR" rcs "$OUT/libwebrtc-audio-processing-1.a"
+          "$RANLIB" "$OUT/libwebrtc-audio-processing-1.a"
+
+          echo "----- confirm result is a FAT self-contained archive -----"
+          printf '%-45s ' "libwebrtc-audio-processing-1.a"; head -c 7 "$OUT/libwebrtc-audio-processing-1.a"; echo
           ls -la "$OUT"
-          echo "----- confirm each is FAT now (expect: !<arch>) -----"
-          for a in "$OUT"/*.a; do
-            printf '%-40s ' "$(basename "$a")"; head -c 7 "$a"; echo
-          done
-          echo "----- spot-check: ar x must now succeed on a converted archive -----"
-          probe=$(ls "$OUT"/*.a | head -1)
-          mkdir /tmp/probe && (cd /tmp/probe && "$AR" x "$probe" && echo "ar x OK: $(ls | wc -l) objects extracted")
+          echo "----- member count inside the archive (must equal $NOBJ) -----"
+          INCOUNT=$("$AR" t "$OUT/libwebrtc-audio-processing-1.a" | grep -c . || true)
+          echo "members in archive: $INCOUNT"
+          test "$INCOUNT" -eq "$NOBJ" || { echo "!! archive holds $INCOUNT members but we fed $NOBJ objects — mismatch. Aborting."; exit 1; }
+          echo "----- spot-check: ar x must succeed (proves not thin) -----"
+          mkdir /tmp/probe && (cd /tmp/probe && "$AR" x "$OUT/libwebrtc-audio-processing-1.a" && echo "ar x OK: $(ls | wc -l) objects extracted")
 
       - name: Stage the headers exactly as they will be committed
         run: |
@@ -157,7 +160,7 @@ jobs:
           echo "----- sanity: the primary public header is present -----"
           find "$OUT" -name 'audio_processing.h' | sort
 
-      - name: RE-LINK the shim against the CONVERTED FAT archives (the real proof)
+      - name: RE-LINK the shim against the ONE committable archive (the real proof)
         run: |
           NDK="${{ steps.ndk.outputs.ndk-path }}"
           CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang++"
@@ -167,15 +170,18 @@ jobs:
           INC1="$STAGE/include/webrtc-audio-processing-1"
           INC2="$STAGE/include"
           SHIM="$GITHUB_WORKSPACE/android/src/main/cpp/aec3_shim.cpp"
+          LIB="$STAGE/lib/libwebrtc-audio-processing-1.a"
 
-          LIBS=$(find "$STAGE/lib" -name '*.a' | sort)
-          echo "----- linking shim against CONVERTED archives -----"
-          echo "$LIBS"
+          echo "----- linking shim against the single fat archive -----"
+          ls -la "$LIB"
 
+          # --start-group around the single archive lets the linker resolve any
+          # circular references among the now co-located WebRTC + Abseil objects
+          # regardless of member order inside the archive.
           "$CXX" -std=c++17 -fPIC -shared \
             -I"$INC1" -I"$INC2" \
             "$SHIM" \
-            -Wl,--start-group $LIBS -Wl,--end-group \
+            -Wl,--start-group "$LIB" -Wl,--end-group \
             -llog \
             -Wl,-z,max-page-size=16384 \
             -o /tmp/libsix_pages_voice_aec3.so
