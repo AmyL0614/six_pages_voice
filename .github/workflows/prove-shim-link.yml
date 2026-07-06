@@ -78,31 +78,7 @@ jobs:
           meson compile -C build_arm64
           meson install -C build_arm64
 
-      - name: Bundle main APM + all Abseil objects into ONE fat static lib
-        run: |
-          cd wap
-          NDK="${{ steps.ndk.outputs.ndk-path }}"
-          AR="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-
-          echo "----- every .a the build produced (main libs are installed; abseil libs live in the build tree) -----"
-          find build_arm64 install/arm64 -name '*.a' | sort
-
-          # Collect the installed main lib plus every Abseil archive from the build tree.
-          mkdir -p fat/obj
-          cd fat/obj
-          for a in $(find "$OLDPWD/install/arm64" -name 'libwebrtc-audio-processing-1.a') \
-                   $(find "$OLDPWD/build_arm64" -path '*abseil*' -name '*.a'); do
-            echo "extracting: $a"
-            "$AR" x "$a"
-          done
-          cd ..
-          # Combine every extracted object into one archive.
-          "$AR" rcs libwebrtc-apm-fat.a obj/*.o
-          echo "----- fat lib built -----"
-          ls -la libwebrtc-apm-fat.a
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h libwebrtc-apm-fat.a 2>/dev/null | grep -i machine | head -3
-
-      - name: Compile + LINK the shim against the fat lib (the actual proof)
+      - name: Compile + LINK the shim against ALL component archives (the proof)
         run: |
           cd wap
           NDK="${{ steps.ndk.outputs.ndk-path }}"
@@ -111,32 +87,34 @@ jobs:
           INC2="$PWD/install/arm64/include"
           SHIM="$GITHUB_WORKSPACE/android/src/main/cpp/aec3_shim.cpp"
 
-          echo "----- compiling + linking shim into a .so (proves symbols resolve) -----"
+          echo "----- every .a the build produced -----"
+          find build_arm64 install/arm64 -name '*.a' | sort
+
+          # Gather every component archive (WebRTC parts + Abseil). Linkers
+          # handle thin archives fine; only ar-extraction does not. Wrap them
+          # in --start-group/--end-group so inter-archive symbol references
+          # resolve regardless of order.
+          LIBS=$(find build_arm64 -name '*.a' | sort)
+          echo "----- linking shim against these -----"
+          echo "$LIBS"
+
           "$CXX" -std=c++17 -fPIC -shared \
             -I"$INC1" -I"$INC2" \
             "$SHIM" \
-            fat/libwebrtc-apm-fat.a \
+            -Wl,--start-group $LIBS -Wl,--end-group \
             -llog \
             -Wl,-z,max-page-size=16384 \
             -o libsix_pages_voice_aec3.so
           echo "----- LINK SUCCEEDED -----"
           ls -la libsix_pages_voice_aec3.so
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d libsix_pages_voice_aec3.so 2>/dev/null | head -5
           echo "----- confirm our JNI symbols are exported -----"
           "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D libsix_pages_voice_aec3.so | grep -i "nativeCreate\|nativeProcessRender\|nativeProcessCapture\|nativeDestroy" || echo "(no JNI symbols found — investigate)"
 
-      - name: Stage the prebuilt artifact for committing (Way B deliverable)
-        run: |
-          cd wap
-          mkdir -p prebuilt/arm64/lib prebuilt/arm64/include
-          cp fat/libwebrtc-apm-fat.a prebuilt/arm64/lib/libwebrtc-audio-processing-1.a
-          cp -r install/arm64/include/* prebuilt/arm64/include/
-          echo "----- staged prebuilt tree -----"
-          find prebuilt -maxdepth 3 -type d | sort
-          ls -la prebuilt/arm64/lib/
-
-      - name: Upload the prebuilt artifact
+      - name: Upload the built .so and component libs (for inspection)
         uses: actions/upload-artifact@v4
         with:
-          name: webrtc-apm-prebuilt-arm64
-          path: wap/prebuilt/**
+          name: shim-link-proof-arm64
+          path: |
+            wap/libsix_pages_voice_aec3.so
+            wap/build_arm64/**/*.a
+            wap/install/arm64/include/**
