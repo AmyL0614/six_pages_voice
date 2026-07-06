@@ -329,29 +329,55 @@ class SixPagesVoicePlugin :
     // The MEASURED render->capture delay (ms) for the current instant. Uses the
     // AudioTrack playback timestamp when available; falls back to the buffer
     // estimate during warm-up or if the timestamp is unavailable.
+    // Tracks which measurement path drove the last delay, for the throttled
+    // diagnostic log: "TS" (getTimestamp), "HEAD" (getPlaybackHeadPosition),
+    // or "FALLBACK" (buffer math).
+    @Volatile private var lastDelaySource = "FALLBACK"
+
     private fun currentStreamDelayMs(): Int {
-        val track = audioTrack ?: return bufferFallbackDelayMs()
+        val track = audioTrack ?: run { lastDelaySource = "FALLBACK"; return bufferFallbackDelayMs() }
         val written: Long
         synchronized(playbackLock) { written = framesWritten }
 
+        // --- Preferred: getTimestamp() (most precise when supported) ---
         val haveTs = try {
             track.getTimestamp(playbackTimestamp)
         } catch (_: Exception) {
             false
         }
-        if (!haveTs || playbackTimestamp.framePosition <= 0L) {
-            // Warm-up window or no timestamp: principled fallback.
-            return bufferFallbackDelayMs()
+        if (haveTs && playbackTimestamp.framePosition > 0L) {
+            val inFlight = written - playbackTimestamp.framePosition
+            if (inFlight in 0..(sampleRate.toLong())) {  // sanity: < 1s in-flight
+                lastDelaySource = "TS"
+                val outMs = inFlight.toDouble() / sampleRate * 1000.0
+                return (outMs + inputLatencyMs).toInt().coerceIn(minDelayMs, maxDelayMs)
+            }
         }
 
-        // Frames written but not yet presented = audio still in the pipeline.
-        val inFlight = written - playbackTimestamp.framePosition
-        if (inFlight < 0) {
-            // Shouldn't happen, but never feed AEC3 a negative/garbage value.
-            return bufferFallbackDelayMs()
+        // --- Primary on this device: getPlaybackHeadPosition() ---
+        // getTimestamp() does not report on the VOICE_COMMUNICATION output path
+        // on the SM-S928U (framePosition stays 0). getPlaybackHeadPosition() is
+        // the older, far more widely supported counter of frames actually
+        // played. It returns a 32-bit value that MUST be read as unsigned
+        // (ExoPlayer does exactly this). Reset to 0 by stop()/flush().
+        val headRaw = try {
+            track.playbackHeadPosition
+        } catch (_: Exception) {
+            0
         }
-        val outputLatencyMs = (inFlight.toDouble() / sampleRate * 1000.0)
-        return (outputLatencyMs + inputLatencyMs).toInt().coerceIn(minDelayMs, maxDelayMs)
+        val framesPlayed = headRaw.toLong() and 0xFFFFFFFFL  // unsigned
+        if (framesPlayed > 0L) {
+            val inFlight = written - framesPlayed
+            if (inFlight in 0..(sampleRate.toLong())) {
+                lastDelaySource = "HEAD"
+                val outMs = inFlight.toDouble() / sampleRate * 1000.0
+                return (outMs + inputLatencyMs).toInt().coerceIn(minDelayMs, maxDelayMs)
+            }
+        }
+
+        // --- Fallback: buffer math (warm-up or both measurements unavailable) ---
+        lastDelaySource = "FALLBACK"
+        return bufferFallbackDelayMs()
     }
 
     // --- Capture + WebRTC AEC3 ---
@@ -424,7 +450,7 @@ class SixPagesVoicePlugin :
                         // (50 frames * 20 ms) so logcat shows real convergence.
                         frameCounter++
                         if (frameCounter % 50 == 0) {
-                            Log.i(tag, "measured stream delay = $delayMs ms")
+                            Log.i(tag, "measured stream delay = $delayMs ms (source=$lastDelaySource)")
                         }
                     }
                     mainHandler.post { eventSink?.success(frame) }
