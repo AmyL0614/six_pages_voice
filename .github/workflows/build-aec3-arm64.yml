@@ -1,0 +1,102 @@
+# .github/workflows/build-aec3-arm64.yml
+#
+# Builds the WebRTC AudioProcessing module (contains AEC3) as a static
+# library for Android arm64-v8a, from a pinned upstream commit.
+#
+# Stage 1: prove it builds. Meson fetches Abseil on the runner and
+# verifies it against the SHA-256 hashes baked into the wrap file.
+#
+# Trigger: run it by hand from the Actions tab (workflow_dispatch).
+
+name: Build AEC3 arm64
+
+on:
+  workflow_dispatch:        # a "Run workflow" button in the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest  # GitHub's free Linux robot; has the NDK available
+
+    env:
+      # The exact frozen snapshot we vetted. Never "main".
+      WAP_REPO: https://github.com/helloooideeeeea/webrtc-audio-processing.git
+      WAP_COMMIT: f8efa8486ac0dd463fb84e4e99be2e072c28adb8
+      NDK_VERSION: "27.0.12077973"
+      ANDROID_API: "28"
+
+    steps:
+      - name: Install Meson and Ninja
+        run: |
+          pip install --upgrade meson ninja
+          meson --version
+          ninja --version
+
+      - name: Set up the Android NDK (r27)
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27
+
+      - name: Fetch the pinned WebRTC audio-processing source
+        run: |
+          git clone "$WAP_REPO" wap
+          cd wap
+          git checkout "$WAP_COMMIT"
+          git rev-parse HEAD    # print it so the log proves what we built
+
+      - name: Write a Linux cross-file for arm64
+        run: |
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          cat > wap/cross_linux_aarch64.ini <<EOF
+          [constants]
+          ndk_path    = '${NDK}'
+          bin         = ndk_path + '/toolchains/llvm/prebuilt/linux-x86_64/bin/'
+          toolchain   = bin + 'aarch64-linux-android'
+          api         = '${ANDROID_API}'
+
+          [host_machine]
+          system      = 'android'
+          cpu_family  = 'aarch64'
+          cpu         = 'aarch64'
+          endian      = 'little'
+
+          [properties]
+          sys_root        = ndk_path + '/sysroot'
+          c_link_args     = ['-fuse-ld=lld', '-Wl,-z,max-page-size=16384', '-Wl,-z,common-page-size=16384']
+          cpp_link_args   = ['-fuse-ld=lld', '-Wl,-z,max-page-size=16384', '-Wl,-z,common-page-size=16384']
+
+          [binaries]
+          c           = toolchain + api + '-clang'
+          cpp         = toolchain + api + '-clang++'
+          ar          = bin + 'llvm-ar'
+          strip       = toolchain + '-strip'
+          EOF
+          echo "----- cross-file written: -----"
+          cat wap/cross_linux_aarch64.ini
+
+      - name: Configure and build (static library)
+        run: |
+          cd wap
+          meson setup build_arm64 \
+            --cross-file cross_linux_aarch64.ini \
+            --default-library=static \
+            --buildtype=release \
+            -Dprefix=$PWD/install/arm64
+          meson compile -C build_arm64
+          meson install -C build_arm64
+
+      - name: Show what got built (proof, not just "no error")
+        run: |
+          cd wap
+          echo "----- installed tree -----"
+          find install/arm64 -type f | sort
+          echo "----- confirm it is arm64 (aarch64) -----"
+          LIB=$(find install/arm64 -name '*.a' | head -1)
+          file "$LIB"
+          "${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$LIB" 2>/dev/null | grep -i machine || echo "(readelf on .a — machine shown per-object)"
+
+      - name: Upload the artifact so you can download it
+        uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-aec3-arm64
+          path: wap/install/arm64/**
