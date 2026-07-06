@@ -1,0 +1,73 @@
+# .github/workflows/vendor-assemble.yml
+#
+# Stage 2 (assemble): produce ONE complete, ready-to-commit vendored tree.
+# It contains the pinned fork source AND the verified Abseil packagecache,
+# with upstream git history stripped so it becomes YOUR plain files.
+#
+# You download the single artifact, extract it into the repo under
+# third_party/webrtc-audio-processing/, and commit. After that the build
+# depends on nothing external.
+#
+# Trigger: run it by hand from the Actions tab (workflow_dispatch).
+
+name: Vendor - assemble full tree
+
+on:
+  workflow_dispatch:
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+
+    env:
+      WAP_REPO: https://github.com/helloooideeeeea/webrtc-audio-processing.git
+      WAP_COMMIT: f8efa8486ac0dd463fb84e4e99be2e072c28adb8
+      # The two Abseil files the wrap pins, with their required SHA-256s.
+      ABSL_TARBALL_URL: https://github.com/abseil/abseil-cpp/archive/20230125.1.tar.gz
+      ABSL_TARBALL: abseil-cpp-20230125.1.tar.gz
+      ABSL_TARBALL_SHA: 81311c17599b3712069ded20cca09a62ab0bf2a89dfa16993786c8782b7ed145
+      ABSL_PATCH_URL: https://wrapdb.mesonbuild.com/v2/abseil-cpp_20230125.1-4/get_patch
+      ABSL_PATCH: abseil-cpp_20230125.1-4_patch.zip
+      ABSL_PATCH_SHA: 112ee72052049d930396c2778fc1c6e184137905dd75d60a97dcfc386426610d
+
+    steps:
+      - name: Fetch the pinned fork source
+        run: |
+          git clone "$WAP_REPO" wap
+          cd wap
+          git checkout "$WAP_COMMIT"
+          echo "Vendored from commit:"
+          git rev-parse HEAD
+
+      - name: Populate packagecache with the two verified Abseil files
+        run: |
+          cd wap/subprojects
+          mkdir -p packagecache
+          cd packagecache
+
+          echo "----- downloading Abseil source tarball -----"
+          curl -sSL -o "$ABSL_TARBALL" "$ABSL_TARBALL_URL"
+          echo "$ABSL_TARBALL_SHA  $ABSL_TARBALL" | sha256sum -c -
+
+          echo "----- downloading Abseil patch -----"
+          curl -sSL -o "$ABSL_PATCH" "$ABSL_PATCH_URL"
+          echo "$ABSL_PATCH_SHA  $ABSL_PATCH" | sha256sum -c -
+
+          echo "----- both files verified. contents: -----"
+          ls -la
+
+      - name: Strip upstream git history (make it YOUR plain files)
+        run: |
+          cd wap
+          rm -rf .git
+          echo "----- final vendored tree size -----"
+          du -sh .
+          echo "----- packagecache present with both files: -----"
+          ls -la subprojects/packagecache/
+
+      - name: Upload the complete vendored tree (one artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-audio-processing-vendored
+          path: wap/**
+          include-hidden-files: true
