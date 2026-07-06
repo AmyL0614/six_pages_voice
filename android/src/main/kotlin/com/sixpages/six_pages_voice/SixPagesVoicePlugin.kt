@@ -24,16 +24,15 @@ import io.flutter.plugin.common.MethodChannel.Result
 /**
  * SixPagesVoicePlugin — CAPTURE + PLAYBACK + SPEAKER ROUTING + EXPLICIT AEC.
  *
- * NEW THIS LAYER: AcousticEchoCanceler (and NoiseSuppressor) bound explicitly
- * to the AudioRecord session. This makes echo cancellation deterministic and
- * ours, rather than relying on mode-dependent OS behavior. Created AFTER the
- * AudioRecord exists and BEFORE it starts recording. Each logs whether it
- * actually engaged (tag SixPagesVoice) — check logcat to confirm on the wire.
+ * Owns mic capture and Joe's playback through the OS voice-communication path,
+ * with an AcousticEchoCanceler (and NoiseSuppressor) bound explicitly to the
+ * AudioRecord session so echo cancellation is deterministic and ours. The AEC
+ * is created AFTER the AudioRecord exists and BEFORE it starts recording, and
+ * logs whether it engaged (tag SixPagesVoice) — check logcat to confirm.
  *
- * The tone/RMS test will NOT show a dramatic before/after here, because the
- * communication path was already suppressing. The REAL echo proof is the
- * transcript test in the next step: wire the plugin into a Joe conversation
- * and confirm Joe's words do NOT echo back in the ElevenLabs transcript.
+ * Contract:
+ *   MethodChannel  six_pages_voice/control  — start() -> Bool, stop(), feedPlayback(Uint8List)
+ *   EventChannel   six_pages_voice/capture  — streams clean PCM16 / 16 kHz / mono frames
  */
 class SixPagesVoicePlugin :
     FlutterPlugin,
@@ -56,8 +55,7 @@ class SixPagesVoicePlugin :
     private var echoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
 
-    private var audioTrack: AudioTrack? = null       // comms path (real)
-    private var loudTrack: AudioTrack? = null         // comms path, test button
+    private var audioTrack: AudioTrack? = null
 
     private var savedAudioMode = AudioManager.MODE_NORMAL
 
@@ -93,13 +91,6 @@ class SixPagesVoicePlugin :
                 }
                 result.success(null)
             }
-            "feedPlaybackLoud" -> {
-                val pcm = call.arguments as? ByteArray
-                if (pcm != null) {
-                    loudTrack?.write(pcm, 0, pcm.size)
-                }
-                result.success(null)
-            }
             else -> result.notImplemented()
         }
     }
@@ -123,11 +114,9 @@ class SixPagesVoicePlugin :
             clearSpeakerRoute()
             return false
         }
-        startLoudPlayback()
         val captureOk = startCapture()
         if (!captureOk) {
             stopPlayback()
-            stopLoudPlayback()
             clearSpeakerRoute()
             return false
         }
@@ -137,7 +126,6 @@ class SixPagesVoicePlugin :
     private fun stopEngine() {
         stopCapture()
         stopPlayback()
-        stopLoudPlayback()
         clearSpeakerRoute()
     }
 
@@ -179,7 +167,7 @@ class SixPagesVoicePlugin :
         am.mode = savedAudioMode
     }
 
-    // --- Playback: comms path (real) ---
+    // --- Playback: comms path ---
 
     private fun startPlayback(): Boolean {
         if (audioTrack != null) return true
@@ -219,48 +207,6 @@ class SixPagesVoicePlugin :
             it.release()
         }
         audioTrack = null
-    }
-
-    // --- Playback: LOUD comms path (test button) ---
-
-    private fun startLoudPlayback(): Boolean {
-        if (loudTrack != null) return true
-        val minBuf = AudioTrack.getMinBufferSize(sampleRate, outChannelConfig, audioFormat)
-        if (minBuf == AudioTrack.ERROR || minBuf == AudioTrack.ERROR_BAD_VALUE) return false
-        val bufferBytes = maxOf(minBuf, 640 * 4)
-
-        val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-        val format = AudioFormat.Builder()
-            .setSampleRate(sampleRate)
-            .setChannelMask(outChannelConfig)
-            .setEncoding(audioFormat)
-            .build()
-
-        val track = AudioTrack(
-            attributes, format, bufferBytes,
-            AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE
-        )
-        if (track.state != AudioTrack.STATE_INITIALIZED) {
-            track.release()
-            return false
-        }
-        loudTrack = track
-        track.play()
-        return true
-    }
-
-    private fun stopLoudPlayback() {
-        loudTrack?.let {
-            try {
-                if (it.playState == AudioTrack.PLAYSTATE_PLAYING) it.stop()
-            } catch (_: IllegalStateException) {
-            }
-            it.release()
-        }
-        loudTrack = null
     }
 
     // --- Capture + explicit AEC ---
