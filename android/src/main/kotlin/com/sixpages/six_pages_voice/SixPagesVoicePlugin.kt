@@ -88,13 +88,47 @@ class SixPagesVoicePlugin :
 
     private var savedAudioMode = AudioManager.MODE_NORMAL
 
-    // AEC3 render->capture delay hint (ms). This is the time from handing Joe's
-    // frame to ProcessReverseStream until its echo is captured by the mic and
-    // handed to ProcessStream, on the VOICE_COMMUNICATION speakerphone path.
-    // AEC3's estimator refines from this starting point; 120 ms is a typical
-    // Android speakerphone round-trip. TUNE THIS against the ElevenLabs
-    // transcript: if Joe's words still leak into user turns, adjust and rebuild.
-    private val aecStreamDelayMs = 120
+    // --- AEC3 render->capture delay, MEASURED (not guessed) --------------
+    //
+    // AEC3 needs the delay between handing Joe's frame to ProcessReverseStream
+    // and the echo of that frame being captured by the mic. Guessing this
+    // (Step A: fixed 120 ms) only half-worked. Here we MEASURE it from the
+    // AudioTrack's own playback clock:
+    //
+    //   output_latency = (frames_written - frames_actually_presented) / rate
+    //
+    // getTimestamp() gives frames_actually_presented + the time it happened.
+    // The gap to what we've written is the audio still in the pipeline = the
+    // real output latency. We add a small input-side latency for the mic path
+    // and feed the sum to set_stream_delay_ms every capture frame.
+    //
+    // getTimestamp() returns nothing during a warm-up window (documented as up
+    // to a few seconds). During that window we fall back to a delay computed
+    // from the AudioTrack's ACTUAL buffer size (read at runtime, not assumed).
+
+    // Total PCM frames handed to the AudioTrack. Updated in feedPlayback under
+    // playbackLock; read by the capture thread's delay computation.
+    @Volatile private var framesWritten: Long = 0
+    private val playbackLock = Any()
+
+    // The AudioTrack's real buffer size in frames, read at create time. Drives
+    // the warm-up fallback delay. 0 until playback starts.
+    @Volatile private var trackBufferFrames: Int = 0
+
+    // Mic input-side latency estimate (ms). The capture path (AudioRecord ->
+    // our read -> ProcessStream) adds a small, roughly fixed delay on top of
+    // the output latency. 10 ms is a conservative typical value for the
+    // VOICE_COMMUNICATION input path; it is a minor additive term, not the
+    // dominant one (output latency dominates).
+    private val inputLatencyMs = 10
+
+    // Clamp the computed delay to a sane band so a bad timestamp reading can
+    // never feed AEC3 a wild value. AEC3 handles up to a few hundred ms.
+    private val minDelayMs = 0
+    private val maxDelayMs = 500
+
+    // Reusable timestamp object (avoid per-frame allocation on the hot path).
+    private val playbackTimestamp = android.media.AudioTimestamp()
 
     // Audio format — the contract: PCM16, 16 kHz, mono.
     private val sampleRate = 16000
@@ -135,7 +169,13 @@ class SixPagesVoicePlugin :
                             nativeProcessRender(h, pcm)
                         }
                     }
-                    audioTrack?.write(pcm, 0, pcm.size)
+                    // Write to the speaker and account the frames so the delay
+                    // measurement knows how much audio we've committed. PCM16
+                    // mono => 2 bytes per frame.
+                    synchronized(playbackLock) {
+                        audioTrack?.write(pcm, 0, pcm.size)
+                        framesWritten += (pcm.size / 2).toLong()
+                    }
                 }
                 result.success(null)
             }
@@ -243,6 +283,15 @@ class SixPagesVoicePlugin :
         }
         audioTrack = track
         track.play()
+
+        // Read the ACTUAL allocated buffer size (may exceed what we requested)
+        // and reset the frame counter. The buffer size drives the warm-up
+        // fallback delay. Logged so the real number is visible in logcat.
+        synchronized(playbackLock) {
+            framesWritten = 0
+            trackBufferFrames = try { track.bufferSizeInFrames } catch (_: Exception) { 0 }
+        }
+        Log.i(tag, "AudioTrack started: bufferSizeInFrames=$trackBufferFrames (fallback delay ~${bufferFallbackDelayMs()} ms until timestamp warms up)")
         return true
     }
 
@@ -255,6 +304,54 @@ class SixPagesVoicePlugin :
             it.release()
         }
         audioTrack = null
+        synchronized(playbackLock) {
+            framesWritten = 0
+            trackBufferFrames = 0
+        }
+    }
+
+    // Fallback render->capture delay (ms) used during the getTimestamp() warm-up
+    // window, computed from the AudioTrack's real buffer plus mic input latency.
+    // A full buffer's worth of audio is the worst-case output latency before the
+    // pipeline reports timestamps; half-buffer is a reasonable steady estimate.
+    private fun bufferFallbackDelayMs(): Int {
+        val bufFrames = trackBufferFrames
+        if (bufFrames <= 0) {
+            // No buffer info yet: use a conservative default near Android's
+            // documented cold-output latency ceiling (~100 ms) + input.
+            return (100 + inputLatencyMs).coerceIn(minDelayMs, maxDelayMs)
+        }
+        val bufferMs = (bufFrames.toDouble() / sampleRate * 1000.0)
+        // Half the buffer as the typical in-flight amount, + input latency.
+        return ((bufferMs / 2.0) + inputLatencyMs).toInt().coerceIn(minDelayMs, maxDelayMs)
+    }
+
+    // The MEASURED render->capture delay (ms) for the current instant. Uses the
+    // AudioTrack playback timestamp when available; falls back to the buffer
+    // estimate during warm-up or if the timestamp is unavailable.
+    private fun currentStreamDelayMs(): Int {
+        val track = audioTrack ?: return bufferFallbackDelayMs()
+        val written: Long
+        synchronized(playbackLock) { written = framesWritten }
+
+        val haveTs = try {
+            track.getTimestamp(playbackTimestamp)
+        } catch (_: Exception) {
+            false
+        }
+        if (!haveTs || playbackTimestamp.framePosition <= 0L) {
+            // Warm-up window or no timestamp: principled fallback.
+            return bufferFallbackDelayMs()
+        }
+
+        // Frames written but not yet presented = audio still in the pipeline.
+        val inFlight = written - playbackTimestamp.framePosition
+        if (inFlight < 0) {
+            // Shouldn't happen, but never feed AEC3 a negative/garbage value.
+            return bufferFallbackDelayMs()
+        }
+        val outputLatencyMs = (inFlight.toDouble() / sampleRate * 1000.0)
+        return (outputLatencyMs + inputLatencyMs).toInt().coerceIn(minDelayMs, maxDelayMs)
     }
 
     // --- Capture + WebRTC AEC3 ---
@@ -286,10 +383,12 @@ class SixPagesVoicePlugin :
                 if (h == 0L) {
                     Log.w(tag, "nativeCreate() returned 0 — AEC3 engine not created; capture will be UNCANCELLED")
                 } else {
-                    // AEC3 requires the render->capture delay when echo processing
-                    // is enabled. Set it now so the very first frames align.
-                    nativeSetStreamDelayMs(h, aecStreamDelayMs)
-                    Log.i(tag, "AEC3 engine created (handle set), stream delay = $aecStreamDelayMs ms")
+                    // The render->capture delay is now MEASURED and set per
+                    // capture frame (see the capture thread below), not fixed
+                    // here. Seed it once with the current best estimate so the
+                    // very first frames aren't at zero.
+                    nativeSetStreamDelayMs(h, currentStreamDelayMs())
+                    Log.i(tag, "AEC3 engine created (handle set); measured stream delay in use")
                 }
             }
         }
@@ -300,6 +399,7 @@ class SixPagesVoicePlugin :
 
         captureThread = Thread {
             val buf = ByteArray(frameBytes)
+            var frameCounter = 0
             while (capturing) {
                 val read = record.read(buf, 0, buf.size)
                 if (read > 0) {
@@ -312,7 +412,20 @@ class SixPagesVoicePlugin :
                     // which AEC3's threading model permits concurrently.)
                     val h = aecHandle
                     if (h != 0L) {
+                        // Feed AEC3 the CURRENT measured render->capture delay,
+                        // then clean the frame. Computed from the AudioTrack
+                        // playback clock (falls back to buffer estimate during
+                        // warm-up). This is what makes cancellation converge.
+                        val delayMs = currentStreamDelayMs()
+                        nativeSetStreamDelayMs(h, delayMs)
                         nativeProcessCapture(h, frame)
+
+                        // Throttled visibility: log the measured delay ~once/sec
+                        // (50 frames * 20 ms) so logcat shows real convergence.
+                        frameCounter++
+                        if (frameCounter % 50 == 0) {
+                            Log.i(tag, "measured stream delay = $delayMs ms")
+                        }
                     }
                     mainHandler.post { eventSink?.success(frame) }
                 }
