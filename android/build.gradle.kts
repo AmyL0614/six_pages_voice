@@ -25,6 +25,15 @@ plugins {
     id("com.android.library")
 }
 
+// Flutter 3.44 built-in Kotlin: under AGP >= 9 the Kotlin Android plugin is
+// applied by the toolchain, so we must NOT re-apply it. Under AGP < 9 we apply
+// it explicitly. This makes the plugin build on both. (Flutter plugin-author
+// migration guide.)
+val agpMajor = com.android.Version.ANDROID_GRADLE_PLUGIN_VERSION.substringBefore('.').toInt()
+if (agpMajor < 9) {
+    apply(plugin = "org.jetbrains.kotlin.android")
+}
+
 android {
     namespace = "com.sixpages.six_pages_voice"
 
@@ -65,9 +74,9 @@ android {
     }
 }
 
-tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
-    kotlinOptions {
-        jvmTarget = "17"
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
     }
 }
 
