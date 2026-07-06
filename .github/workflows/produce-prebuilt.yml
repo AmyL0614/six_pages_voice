@@ -1,0 +1,190 @@
+# .github/workflows/produce-prebuilt.yml
+#
+# Produces the COMMITTABLE Way-B deliverable: the WebRTC AudioProcessing
+# (AEC3) static library set, staged exactly as it will live in the repo at
+#   android/src/main/cpp/prebuilt/arm64/lib/      (the archives)
+#   android/src/main/cpp/prebuilt/arm64/include/  (the headers)
+#
+# WHY THIS EXISTS (Way B, locked): we commit a PREBUILT library and link it,
+# instead of rebuilding the ~700-file C++ library on every app build. This
+# workflow regenerates that prebuilt from the pinned vendored source, so the
+# committed artifact is always reproducible from source.
+#
+# THE THIN-ARCHIVE GOTCHA (proven, handled here):
+# Meson emits THIN static archives (header "!<thin>") that only REFERENCE
+# their .o object files by path in the build tree. Copied out of the build
+# tree, a thin archive is dead. And `ar x` refuses to operate on thin
+# archives at all. So we do NOT extract. Instead, for each thin archive we
+# read its member object paths with `ar t` and RE-ARCHIVE those objects into
+# a real, self-contained ("!<arch>") fat archive that is safe to commit.
+# The `ar t` paths are RELATIVE TO THE ARCHIVE'S OWN DIRECTORY, so each
+# conversion runs from inside that directory.
+#
+# PROOF, NOT ABSENCE OF ERROR: after converting, this workflow RE-LINKS the
+# real shim (aec3_shim.cpp) against the CONVERTED FAT archives and checks the
+# four JNI symbols are exported. A green run means the exact bytes we upload
+# (and will commit) are the exact bytes that link.
+#
+# Trigger: run it by hand from the Actions tab (workflow_dispatch).
+
+name: Produce committable prebuilt (arm64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+
+    env:
+      NDK_VERSION: "27.0.12077973"
+      ANDROID_API: "28"
+
+    steps:
+      - name: Check out this repo (vendored source + shim)
+        uses: actions/checkout@v4
+
+      - name: Install Meson and Ninja
+        run: |
+          pip install --upgrade meson ninja
+          meson --version
+          ninja --version
+
+      - name: Set up the Android NDK (r27)
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27
+
+      - name: Build the WebRTC APM from vendored source (sealed, offline)
+        run: |
+          cp -r third_party/webrtc-audio-processing wap
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          cat > wap/cross_linux_aarch64.ini <<EOF
+          [constants]
+          ndk_path    = '${NDK}'
+          bin         = ndk_path + '/toolchains/llvm/prebuilt/linux-x86_64/bin/'
+          toolchain   = bin + 'aarch64-linux-android'
+          api         = '${ANDROID_API}'
+
+          [host_machine]
+          system      = 'android'
+          cpu_family  = 'aarch64'
+          cpu         = 'aarch64'
+          endian      = 'little'
+
+          [properties]
+          sys_root        = ndk_path + '/sysroot'
+          c_link_args     = ['-fuse-ld=lld', '-Wl,-z,max-page-size=16384', '-Wl,-z,common-page-size=16384']
+          cpp_link_args   = ['-fuse-ld=lld', '-Wl,-z,max-page-size=16384', '-Wl,-z,common-page-size=16384']
+
+          [binaries]
+          c           = toolchain + api + '-clang'
+          cpp         = toolchain + api + '-clang++'
+          ar          = bin + 'llvm-ar'
+          strip       = toolchain + '-strip'
+          EOF
+          cd wap
+          meson setup build_arm64 \
+            --cross-file cross_linux_aarch64.ini \
+            --default-library=static \
+            --buildtype=release \
+            --wrap-mode=nodownload \
+            -Dprefix=$PWD/install/arm64
+          meson compile -C build_arm64
+          meson install -C build_arm64
+
+      - name: Inventory the thin archives the build produced (proof)
+        run: |
+          cd wap
+          echo "----- every .a under build_arm64 (these are the link set) -----"
+          find build_arm64 -name '*.a' | sort
+          echo "----- confirm they are THIN (expect: !<thin>) -----"
+          for a in $(find build_arm64 -name '*.a' | sort); do
+            printf '%-70s ' "$a"; head -c 7 "$a"; echo
+          done
+
+      - name: Convert each thin archive to a real (fat) archive
+        run: |
+          cd wap
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          AR="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          RANLIB="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib"
+
+          OUT="$GITHUB_WORKSPACE/prebuilt_staging/lib"
+          mkdir -p "$OUT"
+
+          # For each thin archive: cd into its directory (so the relative
+          # member paths from `ar t` resolve), read its members, and build a
+          # fresh fat archive of those objects into the staging dir.
+          for a in $(find "$PWD/build_arm64" -name '*.a' | sort); do
+            dir=$(dirname "$a")
+            base=$(basename "$a")
+            echo "=== converting $base ==="
+            (
+              cd "$dir"
+              members=$("$AR" t "$base")
+              if [ -z "$members" ]; then
+                echo "!! $base has no members — aborting"; exit 1
+              fi
+              # rcs = replace, create, write index. Fresh output => fat archive.
+              "$AR" rcs "$OUT/$base" $members
+              "$RANLIB" "$OUT/$base"
+            )
+          done
+
+          echo "----- staged fat archives -----"
+          ls -la "$OUT"
+          echo "----- confirm each is FAT now (expect: !<arch>) -----"
+          for a in "$OUT"/*.a; do
+            printf '%-40s ' "$(basename "$a")"; head -c 7 "$a"; echo
+          done
+          echo "----- spot-check: ar x must now succeed on a converted archive -----"
+          probe=$(ls "$OUT"/*.a | head -1)
+          mkdir /tmp/probe && (cd /tmp/probe && "$AR" x "$probe" && echo "ar x OK: $(ls | wc -l) objects extracted")
+
+      - name: Stage the headers exactly as they will be committed
+        run: |
+          cd wap
+          OUT="$GITHUB_WORKSPACE/prebuilt_staging/include"
+          mkdir -p "$OUT"
+          cp -r install/arm64/include/* "$OUT"/
+          echo "----- staged include tree (top levels) -----"
+          find "$OUT" -maxdepth 2 -type d | sort
+          echo "----- sanity: the primary public header is present -----"
+          find "$OUT" -name 'audio_processing.h' | sort
+
+      - name: RE-LINK the shim against the CONVERTED FAT archives (the real proof)
+        run: |
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang++"
+          NM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+
+          STAGE="$GITHUB_WORKSPACE/prebuilt_staging"
+          INC1="$STAGE/include/webrtc-audio-processing-1"
+          INC2="$STAGE/include"
+          SHIM="$GITHUB_WORKSPACE/android/src/main/cpp/aec3_shim.cpp"
+
+          LIBS=$(find "$STAGE/lib" -name '*.a' | sort)
+          echo "----- linking shim against CONVERTED archives -----"
+          echo "$LIBS"
+
+          "$CXX" -std=c++17 -fPIC -shared \
+            -I"$INC1" -I"$INC2" \
+            "$SHIM" \
+            -Wl,--start-group $LIBS -Wl,--end-group \
+            -llog \
+            -Wl,-z,max-page-size=16384 \
+            -o /tmp/libsix_pages_voice_aec3.so
+          echo "----- LINK AGAINST COMMITTABLE ARTIFACT SUCCEEDED -----"
+          ls -la /tmp/libsix_pages_voice_aec3.so
+          echo "----- confirm the four JNI symbols are exported -----"
+          found=$("$NM" -D /tmp/libsix_pages_voice_aec3.so | grep -c "nativeCreate\|nativeProcessRender\|nativeProcessCapture\|nativeDestroy")
+          echo "JNI symbols found: $found (expect 4)"
+          test "$found" -eq 4 || { echo "!! expected 4 JNI symbols, got $found"; exit 1; }
+
+      - name: Upload the committable prebuilt (lib/ + include/)
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-arm64
+          path: prebuilt_staging/**
