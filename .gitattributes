@@ -1,0 +1,8 @@
+# Native binary artifacts must NEVER have line-ending conversion applied.
+# A single CRLF rewrite corrupts a static/shared library. Force binary.
+*.a   binary
+*.so  binary
+*.o   binary
+
+# The committed AEC3 prebuilt archive (belt-and-suspenders, explicit path).
+android/src/main/cpp/prebuilt/** binary
