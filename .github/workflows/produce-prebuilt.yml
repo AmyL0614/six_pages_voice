@@ -114,24 +114,27 @@ jobs:
           OUT="$GITHUB_WORKSPACE/prebuilt_staging/lib"
           mkdir -p "$OUT"
 
-          # For each thin archive: cd into its directory (so the relative
-          # member paths from `ar t` resolve), read its members, and build a
-          # fresh fat archive of those objects into the staging dir.
-          for a in $(find "$PWD/build_arm64" -name '*.a' | sort); do
-            dir=$(dirname "$a")
+          # Meson stores thin-archive member paths RELATIVE TO THE BUILD ROOT
+          # (build_arm64), not relative to each archive's own directory. Some
+          # archives reference objects in SIBLING dirs (e.g. ../foo/x.o), which
+          # only resolve from the build root. So we run the conversion from
+          # inside build_arm64 for every archive, using the archive's path
+          # relative to that root. `ar t` then prints resolvable paths, and
+          # `ar rcs` finds every object. (Proven: cd-ing into dirname breaks
+          # cross-directory members like checks.cc.o.)
+          cd build_arm64
+          for a in $(find . -name '*.a' | sort); do
             base=$(basename "$a")
-            echo "=== converting $base ==="
-            (
-              cd "$dir"
-              members=$("$AR" t "$base")
-              if [ -z "$members" ]; then
-                echo "!! $base has no members — aborting"; exit 1
-              fi
-              # rcs = replace, create, write index. Fresh output => fat archive.
-              "$AR" rcs "$OUT/$base" $members
-              "$RANLIB" "$OUT/$base"
-            )
+            echo "=== converting $base ($a) ==="
+            members=$("$AR" t "$a")
+            if [ -z "$members" ]; then
+              echo "!! $base has no members — aborting"; exit 1
+            fi
+            # rcs = replace, create, write index. Fresh output => fat archive.
+            "$AR" rcs "$OUT/$base" $members
+            "$RANLIB" "$OUT/$base"
           done
+          cd ..
 
           echo "----- staged fat archives -----"
           ls -la "$OUT"
