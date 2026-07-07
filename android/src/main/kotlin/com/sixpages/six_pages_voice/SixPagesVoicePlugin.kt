@@ -366,6 +366,10 @@ class SixPagesVoicePlugin :
             0
         }
         val framesPlayed = headRaw.toLong() and 0xFFFFFFFFL  // unsigned
+        // DIAGNOSTIC (temporary): show the raw numbers the phone reports so we
+        // can see WHY the HEAD measurement is being accepted or rejected.
+        val inFlightDiag = written - framesPlayed
+        Log.i(tag, "HEAD diag: framesPlayed=$framesPlayed written=$written inFlight=$inFlightDiag bufFrames=$trackBufferFrames")
         if (framesPlayed > 0L) {
             val inFlight = written - framesPlayed
             if (inFlight in 0..(sampleRate.toLong())) {
