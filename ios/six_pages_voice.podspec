@@ -5,13 +5,15 @@
 Pod::Spec.new do |s|
   s.name             = 'six_pages_voice'
   s.version          = '0.0.1'
-  s.summary          = 'A new Flutter plugin project.'
+  s.summary          = 'Low-latency ElevenLabs voice with acoustic echo cancellation for Flutter.'
   s.description      = <<-DESC
-A new Flutter plugin project.
+A Flutter plugin providing a real-time voice pipeline with native acoustic echo
+cancellation (AEC3 on Android, VoiceProcessingIO on iOS) for ElevenLabs
+Conversational AI. Exposes start, stop, feedPlayback, and a capture stream.
                        DESC
-  s.homepage         = 'http://example.com'
+  s.homepage         = 'https://github.com/AmyL0614/six_pages_voice'
   s.license          = { :file => '../LICENSE' }
-  s.author           = { 'Your Company' => 'email@example.com' }
+  s.author           = { 'Six Pages Studio, LLC' => 'founder@thesixpages.app' }
   s.source           = { :path => '.' }
   s.source_files = 'six_pages_voice/Sources/six_pages_voice/**/*'
   s.dependency 'Flutter'
