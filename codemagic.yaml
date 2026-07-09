@@ -1,0 +1,50 @@
+# codemagic.yaml — Six Pages Voice plugin CI
+# ---------------------------------------------------------------------------
+# PHASE 1: compile-only iOS check. No signing, no TestFlight.
+# Goal: prove the plugin's example app compiles on a real Apple toolchain.
+#
+# Why a yaml instead of the visual editor:
+#   The visual workflow tried to resolve the Xcode "Runner" scheme BEFORE
+#   Flutter generated the ephemeral Swift Package (Flutter/ephemeral/Packages/
+#   FlutterGeneratedPluginSwiftPackage). That package is .gitignored by design
+#   and only exists after Flutter runs its iOS setup. Here we control ordering:
+#   `flutter build ios` generates the ephemeral package, THEN xcodebuild runs —
+#   so the scheme exists by the time anything looks for it.
+#
+# Later phases (signing + app_store_connect publishing for TestFlight) get
+# added to THIS file. Nothing here is throwaway.
+# ---------------------------------------------------------------------------
+
+workflows:
+  ios-compile-check:
+    name: iOS compile check (no signing)
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Flutter version (for the log)
+        script: flutter --version
+
+      - name: Get plugin + example dependencies
+        script: |
+          set -e
+          cd example
+          flutter pub get
+
+      - name: Build iOS (debug, no codesign)
+        # This is the step that matters. `flutter build ios` runs the iOS
+        # platform setup that generates Flutter/ephemeral/... (creating the
+        # SPM package the pbxproj references), then drives xcodebuild itself.
+        # --no-codesign because Phase 1 proves COMPILE, not signing.
+        script: |
+          set -e
+          cd example
+          flutter build ios --debug --no-codesign
+    artifacts:
+      # If it compiles, capture the .app so we can confirm it was produced
+      # (the "prove the right thing appeared" standard, not just "no error").
+      - example/build/ios/iphoneos/*.app
+      - /tmp/xcodebuild_logs/*.log
