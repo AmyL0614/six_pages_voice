@@ -7,31 +7,24 @@ import os.log
 // ─────────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 4: SAMPLE-RATE INSTRUMENTATION (risk 1, decide-first).
+// STEP B, LAYER 5 (BUILD 1): SELF-REPORTING DIAGNOSTICS (make us sighted).
 //
-// Layers 1–3 built and compiled the full loop (session → VoiceProcessingIO →
-// playback ring + render → capture ring + input → 640-byte drain to Dart),
-// ASSUMING the hardware grants our preferred 16 kHz.
+// On-device symptom: Joe plays but is evenly chopped through every sentence,
+// right-ish pitch, slightly fast. AEC works (transcript user turns are clean),
+// so the fault is playback-side only. Leading hypothesis (blind): hardware runs
+// 48 kHz while we forced a 16 kHz client format → Joe consumed too fast → render
+// underruns → even chop.
 //
-// July 7 risk 1 is that setPreferredSampleRate(16000) is only a PREFERENCE —
-// hardware may run 48 kHz, in which case the unit would deliver/expect 48 kHz
-// frames while our rings + Dart + VAD + ElevenLabs all expect 16 kHz.
+// We have NO Mac / no Console. So before writing any converter, this build makes
+// the plugin REPORT the actual granted sample rate + negotiated formats back to
+// the APP, via a new "getDiagnostics" method. This changes NOTHING about audio —
+// it only lets us READ the number in-app and confirm the hypothesis, exactly
+// like the Android side proved written=0 / framesPlayed instead of guessing.
+// Build 2 then writes the converter against the CONFIRMED rate.
 //
-// The handoff's literal sketch was: insert AVAudioConverter on each side when
-// actual ≠ 16000. This session chose a sturdier, decide-first path instead: do
-// NOT write blind converters for a problem not yet confirmed on real hardware.
-// Many iOS devices honor a 16 kHz client stream format on VoiceProcessingIO
-// (the unit converts internally, like Android's framework does), in which case
-// NO converter is ever needed. So Layer 4 = INSTRUMENTATION: log the actual
-// granted session rate and the actual negotiated unit formats, keep the clean
-// 16 kHz path, and let the one TestFlight build tell us the truth. If (and only
-// if) a real device proves 16 kHz is refused, a targeted converter is written
-// against the exact observed behavior — not a guess. [Rationale must be carried
-// into the handoff, since this reasoning lives in the session, not the file.]
-//
-// LOOP RECAP (Layers 1–3, unchanged here):
-// The input callback pulls mic audio the OS has ALREADY echo-cancelled; clean
-// frames go into a capture ring; a drain pushes 640-byte (20 ms) frames to Dart.
+// LOOP (Layers 1–4, unchanged): session → VoiceProcessingIO → playback ring +
+// render → capture ring + input → 640-byte drain to Dart. AEC by the OS.
+// ─────────────────────────────────────────────────────────────────────────────
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
 // (20 ms) frames, one frame pushed per hop to the platform thread — the iOS
@@ -171,6 +164,21 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
   private var captureSink: FlutterEventSink?
 
+  // Build 1 diagnostics: startUnit() fills this with the actual granted rate and
+  // negotiated formats so the app can read it via getDiagnostics (we have no
+  // Mac/Console). Plain string, human-readable.
+  private var lastDiagnostics: String = "no session started yet"
+
+  // Build 1: the render callback (audio thread) updates these so getDiagnostics
+  // can report REAL underrun behavior — the direct measure of the chop. If
+  // underrunFrames is high relative to renderCalls, the buffer is starving.
+  // Plain Ints updated on one thread and read on another; acceptable for a
+  // coarse diagnostic (not a correctness-critical value).
+  fileprivate var renderCalls: Int = 0
+  fileprivate var underrunEvents: Int = 0
+  fileprivate var lastRenderBytesRequested: Int = 0
+  fileprivate var lastInputFrames: Int = 0
+
   public static func register(with registrar: FlutterPluginRegistrar) {
     let messenger = registrar.messenger()
     let controlChannel = FlutterMethodChannel(
@@ -203,6 +211,15 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       stopUnit()
       os_log("stop: unit torn down", log: SixPagesVoicePlugin.log, type: .info)
       result(nil)
+    case "getDiagnostics":
+      // Build 1: return granted rate + negotiated formats + LIVE render/underrun
+      // counts. Underrun ratio is the direct measure of the chop: if
+      // underrunEvents is a large fraction of renderCalls, the buffer starves.
+      // lastRenderBytesRequested vs lastInputFrames reveals rate/frame shape.
+      let live = "renderCalls=\(renderCalls); underruns=\(underrunEvents); "
+        + "lastReqBytes=\(lastRenderBytesRequested); lastInputFrames=\(lastInputFrames)"
+      result(lastDiagnostics + live)
+
     case "feedPlayback":
       if let typed = call.arguments as? FlutterStandardTypedData {
         typed.data.withUnsafeBytes { raw in playback.write(raw) }
@@ -254,6 +271,12 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     }
     os_log("SR-CHECK: ioBufferDuration = %{public}.4f s", log: SixPagesVoicePlugin.log,
            type: .info, ioBufDuration)
+
+    // Build 1: begin building the app-readable diagnostic string.
+    let rateVerdict = abs(grantedRate - SixPagesVoicePlugin.targetSampleRate) < 1.0
+      ? "MATCHES 16k" : "MISMATCH (converter needed)"
+    lastDiagnostics = "granted=\(Int(grantedRate))Hz [\(rateVerdict)]; "
+      + "ioBuf=\(String(format: "%.4f", ioBufDuration))s; "
 
     var desc = AudioComponentDescription(
       componentType: kAudioUnitType_Output,
@@ -417,9 +440,12 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
              label, asbd.mSampleRate, asbd.mChannelsPerFrame, asbd.mBitsPerChannel,
              rateMatches ? "16 kHz honored (rings fed correctly)"
                          : "NOT 16 kHz — converter needed on this bus")
+      // Build 1: append to app-readable diagnostics.
+      lastDiagnostics += "\(label)=\(Int(asbd.mSampleRate))Hz/\(asbd.mChannelsPerFrame)ch; "
     } else {
       os_log("FMT-CHECK [%{public}@]: read failed (OSStatus %d)",
              log: SixPagesVoicePlugin.log, type: .error, label, status)
+      lastDiagnostics += "\(label)=readFail(\(status)); "
     }
   }
 
@@ -432,11 +458,14 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       return noErr
     }
     let buffers = UnsafeMutableAudioBufferListPointer(abl)
+    plugin.renderCalls &+= 1
     for buffer in buffers {
       guard let mData = buffer.mData else { continue }
       let bytesRequested = Int(buffer.mDataByteSize)
+      plugin.lastRenderBytesRequested = bytesRequested
       let provided = plugin.playback.read(into: mData, count: bytesRequested)
       if provided < bytesRequested {
+        plugin.underrunEvents &+= 1
         memset(mData.advanced(by: provided), 0, bytesRequested - provided)
       }
     }
@@ -455,6 +484,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     guard let unit = plugin.ioUnit, let scratch = plugin.captureScratch else { return noErr }
 
     let frames = Int(inNumberFrames)
+    plugin.lastInputFrames = frames
     if frames <= 0 || frames > plugin.captureScratchFrameCap { return noErr }
 
     let byteCount = frames * 2 // Int16 mono
