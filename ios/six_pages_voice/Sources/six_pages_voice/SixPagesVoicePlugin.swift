@@ -7,12 +7,31 @@ import os.log
 // ─────────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 3: INPUT CALLBACK + CAPTURE RING BUFFER (mic → Dart).
+// STEP B, LAYER 4: SAMPLE-RATE INSTRUMENTATION (risk 1, decide-first).
 //
-// Completes the loop. The input callback pulls mic audio from the unit — which
-// VoiceProcessingIO has ALREADY echo-cancelled (Joe's playback reference was
-// subtracted by the OS). Those clean frames go into a capture ring buffer; a
-// drain pushes them up to Dart via captureSink as 640-byte (20 ms) frames.
+// Layers 1–3 built and compiled the full loop (session → VoiceProcessingIO →
+// playback ring + render → capture ring + input → 640-byte drain to Dart),
+// ASSUMING the hardware grants our preferred 16 kHz.
+//
+// July 7 risk 1 is that setPreferredSampleRate(16000) is only a PREFERENCE —
+// hardware may run 48 kHz, in which case the unit would deliver/expect 48 kHz
+// frames while our rings + Dart + VAD + ElevenLabs all expect 16 kHz.
+//
+// The handoff's literal sketch was: insert AVAudioConverter on each side when
+// actual ≠ 16000. This session chose a sturdier, decide-first path instead: do
+// NOT write blind converters for a problem not yet confirmed on real hardware.
+// Many iOS devices honor a 16 kHz client stream format on VoiceProcessingIO
+// (the unit converts internally, like Android's framework does), in which case
+// NO converter is ever needed. So Layer 4 = INSTRUMENTATION: log the actual
+// granted session rate and the actual negotiated unit formats, keep the clean
+// 16 kHz path, and let the one TestFlight build tell us the truth. If (and only
+// if) a real device proves 16 kHz is refused, a targeted converter is written
+// against the exact observed behavior — not a guess. [Rationale must be carried
+// into the handoff, since this reasoning lives in the session, not the file.]
+//
+// LOOP RECAP (Layers 1–3, unchanged here):
+// The input callback pulls mic audio the OS has ALREADY echo-cancelled; clean
+// frames go into a capture ring; a drain pushes 640-byte (20 ms) frames to Dart.
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
 // (20 ms) frames, one frame pushed per hop to the platform thread — the iOS
@@ -219,6 +238,23 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       throw AudioError.session(error.localizedDescription)
     }
 
+    // ── Layer 4 instrumentation: what rate did the hardware ACTUALLY grant? ───
+    // This is the risk-1 verdict. If actualRate == 16000, our clean path is
+    // correct and NO converter is needed. If it differs, the frames the unit
+    // handles are NOT 16 kHz and a targeted converter is required — but we do
+    // not write that until a real device logs the mismatch here.
+    let grantedRate = session.sampleRate
+    let ioBufDuration = session.ioBufferDuration
+    if abs(grantedRate - SixPagesVoicePlugin.targetSampleRate) < 1.0 {
+      os_log("SR-CHECK: session granted %{public}.0f Hz — MATCHES 16 kHz. Clean path valid, no converter needed.",
+             log: SixPagesVoicePlugin.log, type: .info, grantedRate)
+    } else {
+      os_log("SR-CHECK: session granted %{public}.0f Hz — DOES NOT MATCH 16 kHz. Converter WILL be required (risk 1 confirmed on this device).",
+             log: SixPagesVoicePlugin.log, type: .error, grantedRate)
+    }
+    os_log("SR-CHECK: ioBufferDuration = %{public}.4f s", log: SixPagesVoicePlugin.log,
+           type: .info, ioBufDuration)
+
     var desc = AudioComponentDescription(
       componentType: kAudioUnitType_Output,
       componentSubType: kAudioUnitSubType_VoiceProcessingIO,
@@ -289,6 +325,18 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     capture.clear()
 
     try checkStatus("AudioUnitInitialize", AudioUnitInitialize(unit))
+
+    // ── Layer 4 instrumentation: what formats did the unit NEGOTIATE? ─────────
+    // We set 16 kHz client formats on both buses. Read them back to confirm the
+    // unit accepted them (vs silently coercing to hardware rate). This is the
+    // second half of the risk-1 verdict: even if the session rate differs, the
+    // unit may still honor a 16 kHz CLIENT format and convert internally — in
+    // which case our rings are fed 16 kHz and no converter is needed.
+    logNegotiatedFormat(unit, scope: kAudioUnitScope_Output, bus: inputBus,
+                        label: "input-bus client (mic→app)")
+    logNegotiatedFormat(unit, scope: kAudioUnitScope_Input, bus: outputBus,
+                        label: "output-bus client (app→spk)")
+
     try checkStatus("AudioOutputUnitStart", AudioOutputUnitStart(unit))
     isRunning = true
 
@@ -349,6 +397,29 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       os_log("audio: %{public}@ failed (OSStatus %d)",
              log: SixPagesVoicePlugin.log, type: .error, what, status)
       throw AudioError.osStatus(what, status)
+    }
+  }
+
+  /// Layer 4: read back and log the format the unit actually negotiated on a
+  /// given scope/bus. Non-throwing — instrumentation must never break start().
+  private func logNegotiatedFormat(_ unit: AudioUnit,
+                                   scope: AudioUnitScope,
+                                   bus: AudioUnitElement,
+                                   label: String) {
+    var asbd = AudioStreamBasicDescription()
+    var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+    let status = AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
+                                      scope, bus, &asbd, &size)
+    if status == noErr {
+      let rateMatches = abs(asbd.mSampleRate - SixPagesVoicePlugin.targetSampleRate) < 1.0
+      os_log("FMT-CHECK [%{public}@]: %{public}.0f Hz, %d ch, %d-bit — %{public}@",
+             log: SixPagesVoicePlugin.log, type: rateMatches ? .info : .error,
+             label, asbd.mSampleRate, asbd.mChannelsPerFrame, asbd.mBitsPerChannel,
+             rateMatches ? "16 kHz honored (rings fed correctly)"
+                         : "NOT 16 kHz — converter needed on this bus")
+    } else {
+      os_log("FMT-CHECK [%{public}@]: read failed (OSStatus %d)",
+             log: SixPagesVoicePlugin.log, type: .error, label, status)
     }
   }
 
