@@ -4,37 +4,50 @@ import AVFoundation
 import AudioToolbox
 import os.log
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 6 (BUILD 2): 48 kHz ADAPTIVE PLAYBACK (fixes the chop).
+// STEP B, LAYER 7 (BUILD 3): PLAYBACK PRIMING (fixes the residual chop).
 //
-// CONFIRMED by Build 1 on-device diagnostics (iPad):
-//   granted=48000Hz [MISMATCH]; ioBuf=0.0233s;
-//   input-bus client=16000Hz/1ch; output-bus client=16000Hz/1ch;
-//   renderCalls=7905; underruns=7689 (97% UNDERRUN); lastReqBytes=736; lastInputFrames=368
+// CONFIRMED by Build 2 on-device diagnostics (iPad):
+//   granted=48000Hz [MISMATCH (converter needed)]; ioBuf=0.0233s;
+//   feedConv=16k→48000k; input-bus client (mic→app)=16000Hz/1ch;
+//   output-bus client (app→spk)=48000Hz/1ch;
+//   renderCalls=579; underruns=513 (89% UNDERRUN); lastReqBytes=2208; lastInputFrames=368
 //
-// Root cause (now certain, not hypothesis): hardware runs 48 kHz. We fed Joe at
-// 16 kHz but the render callback consumes at the 48 kHz hardware clock → buffer
-// drains ~3× faster than it fills → 97% underrun → even chop, slightly fast.
+// Build 2 verdict: the 16k→48k converter WORKS and the output bus took 48 kHz
+// (both new markers present, confirmed on device). Yet underruns stayed at 89%.
+// So the fix worked on the axis it targeted (rate), but the chop has a SECOND
+// cause on a different axis (timing), which Build 2 did not address.
 //
-// FIX (this build): make PLAYBACK coherent at the real hardware rate.
-//   1. Read granted rate (already have it). Call it hwRate (48000 here).
-//   2. Set the OUTPUT bus (playback) client format to hwRate, so the render
-//      callback's frame math matches the clock it's actually driven by.
-//   3. Joe still arrives from ElevenLabs at 16 kHz. Upsample his bytes 16k→hwRate
-//      with an AVAudioConverter in feedPlayback BEFORE they enter the playback
-//      ring. Now feed-rate == consume-rate → ring stops starving → chop gone.
+// Root cause (Build 3, now certain): there is NO JITTER BUFFER / PRE-ROLL.
+// The render callback pulls ~2208 bytes every ~23 ms starting from the FIRST
+// callback. Joe arrives from ElevenLabs in network-paced BURSTS, not a smooth
+// stream. So the ring's `filled` sits below `bytesRequested` on most pulls →
+// zero-fill → chop. The 500 ms ring has the ROOM; nothing ever WAITS for it to
+// fill before draining begins. Correct rate ≠ smooth delivery.
 //
-// CAPTURE is intentionally LEFT ALONE this build. The transcript proved capture
-// is already clean at the current settings (AEC works, user turns intact). We
-// change ONLY the thing the diagnostics proved broken — playback. If, after this,
-// the transcript ever shows a capture-rate problem, that is a separate, later,
-// diagnostics-first build. Do not pre-emptively touch capture.
+// FIX (this build): prime the playback ring before letting render consume it.
+//   1. `primed` flag + `primeThresholdBytes` (~100 ms at hwRate). While NOT
+//      primed, the render callback outputs clean silence and DOES NOT count an
+//      underrun (priming is not starving). It flips to primed once the ring has
+//      built the cushion, then reads normally.
+//   2. Re-prime on a full drain: if a normal read returns 0 bytes on a nonzero
+//      request (a mid-stream network stall emptied the ring), drop back to
+//      unprimed and bump `reprimeEvents`, so the gap re-buffers silently instead
+//      of chopping through it.
+//   3. Diagnostics extended: primed / reprimes / primeThresh are appended so the
+//      next device readout PROVES the cushion filled and underruns collapsed.
 //
-// Build 1 diagnostics are RETAINED (getDiagnostics still works) so we can verify
-// underruns drop toward 0 on the next device test — prove the fix, don't assume.
-// ─────────────────────────────────────────────────────────────────────────────
+// TRADE-OFF (explicit, decide-first): priming adds ~100 ms of latency before
+// Joe's first audio. For a companion voice this is the right trade — 100 ms is
+// imperceptible in conversation; chop is not. If a device test shows underruns
+// gone but latency too long, lower primeThresholdBytes; if bursts are choppier
+// than 100 ms absorbs, raise it. The diagnostic string tells us which.
+//
+// CONVERTER (Build 2) and CAPTURE are UNTOUCHED. The transcript proved capture
+// clean; Build 2 proved the converter runs. We change ONLY the playback timing.
+// ───────────────────────────────────────────────────────────────────────────
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
 // (20 ms) frames, one frame pushed per hop to the platform thread — the iOS
@@ -48,12 +61,12 @@ import os.log
 //
 //   • start        → Layer 2 + installs the input callback; starts drain.
 //   • feedPlayback → writes Joe's bytes into the playback ring buffer (Layer 2).
-//   • capture      → emits clean 640-byte PCM16 frames (THIS layer).
+//   • capture      → emits clean 640-byte PCM16 frames.
 //   • stop         → tears down unit, stops drain, clears both ring buffers.
 //
 // July 7 risk 3: AECAudioStream's input callback returns kAudio_ParamError even
 // on success. We return noErr correctly on the success path.
-// ─────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────
 
 // MARK: - ByteRingBuffer
 //
@@ -191,6 +204,15 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   fileprivate var lastRenderBytesRequested: Int = 0
   fileprivate var lastInputFrames: Int = 0
 
+  // Build 3 (Layer 7): playback priming state. `primed` gates the render
+  // callback — while false, it emits silence (NOT counted as underrun) until
+  // the ring accumulates `primeThresholdBytes`. `reprimeEvents` counts how many
+  // times a mid-stream full-drain forced a re-prime (network stalls). These are
+  // read by getDiagnostics so the next device test proves the cushion filled.
+  fileprivate var primed = false
+  fileprivate var primeThresholdBytes = 0   // set in startUnit from hwRate (~100 ms)
+  fileprivate var reprimeEvents = 0
+
   // Build 2: actual hardware sample rate read at start (e.g. 48000). The output
   // (playback) bus is formatted to this; Joe's 16 kHz feed is upsampled to it.
   private var hwRate: Double = SixPagesVoicePlugin.targetSampleRate
@@ -237,8 +259,11 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // counts. Underrun ratio is the direct measure of the chop: if
       // underrunEvents is a large fraction of renderCalls, the buffer starves.
       // lastRenderBytesRequested vs lastInputFrames reveals rate/frame shape.
+      // Build 3: append priming state (primed / reprimes / threshold) so we can
+      // prove the cushion filled and underruns collapsed toward 0.
       let live = "renderCalls=\(renderCalls); underruns=\(underrunEvents); "
-        + "lastReqBytes=\(lastRenderBytesRequested); lastInputFrames=\(lastInputFrames)"
+        + "lastReqBytes=\(lastRenderBytesRequested); lastInputFrames=\(lastInputFrames); "
+        + "primed=\(primed); reprimes=\(reprimeEvents); primeThresh=\(primeThresholdBytes)B"
       result(lastDiagnostics + live)
 
     case "feedPlayback":
@@ -307,7 +332,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     lastDiagnostics = "granted=\(Int(grantedRate))Hz [\(rateVerdict)]; "
       + "ioBuf=\(String(format: "%.4f", ioBufDuration))s; "
 
-    // ── Build 2: adopt the real hardware rate for the playback path ───────────
+    // ── Build 2: adopt the real hardware rate for the playback path ──────────
     // The render callback is driven by the hardware clock (grantedRate). We make
     // the output-bus client format match it, and upsample Joe's 16 kHz feed to it.
     hwRate = grantedRate
@@ -329,14 +354,24 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         feedInFormat = inFmt
         feedOutFormat = outFmt
         feedConverter = conv
-        lastDiagnostics += "feedConv=16k→\(Int(hwRate))k; "
+        lastDiagnostics += "feedConv=16k→\(Int(hwRate))Hz; "
       } else {
-        os_log("Build2: FAILED to build feed converter 16k→%{public}.0f", 
+        os_log("Build2: FAILED to build feed converter 16k→%{public}.0f",
                log: SixPagesVoicePlugin.log, type: .error, hwRate)
         lastDiagnostics += "feedConv=BUILD_FAILED; "
         feedConverter = nil
       }
     }
+
+    // ── Build 3: compute the priming cushion (~100 ms at the real hardware rate).
+    // 100 ms of hwRate mono PCM16 = hwRate * 2 bytes * 0.1. At 48 kHz → 9600 B.
+    // Capped to half the ring so we can never demand more than the ring can hold.
+    let hundredMs = Int(hwRate * 2.0 * 0.1)
+    primeThresholdBytes = min(hundredMs, SixPagesVoicePlugin.playbackBufferBytes / 2)
+    primed = false
+    reprimeEvents = 0
+    os_log("Build3: primeThresholdBytes = %d (≈100 ms at %{public}.0f Hz)",
+           log: SixPagesVoicePlugin.log, type: .info, primeThresholdBytes, hwRate)
 
     var desc = AudioComponentDescription(
       componentType: kAudioUnitType_Output,
@@ -426,7 +461,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
     try checkStatus("AudioUnitInitialize", AudioUnitInitialize(unit))
 
-    // ── Layer 4 instrumentation: what formats did the unit NEGOTIATE? ─────────
+    // ── Layer 4 instrumentation: what formats did the unit NEGOTIATE? ────────
     // We set 16 kHz client formats on both buses. Read them back to confirm the
     // unit accepted them (vs silently coercing to hardware rate). This is the
     // second half of the risk-1 verdict: even if the session rate differs, the
@@ -458,6 +493,8 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     feedConverter = nil
     feedInFormat = nil
     feedOutFormat = nil
+    // Build 3: reset priming state so a fresh session re-primes cleanly.
+    primed = false
     if let scratch = captureScratch {
       scratch.deallocate()
       captureScratch = nil
@@ -588,7 +625,14 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     }
   }
 
-  // MARK: - Render callback (playback, audio thread) — Layer 2
+  // MARK: - Render callback (playback, audio thread) — Layer 2 + Build 3 priming
+  //
+  // Build 3: gate consumption on a startup cushion. While NOT primed, output
+  // clean silence and DO NOT count an underrun (priming is not starving) until
+  // the ring holds primeThresholdBytes (~100 ms). Once primed, read normally.
+  // If a normal read returns 0 on a nonzero request (mid-stream stall drained
+  // the ring), drop back to unprimed and count a re-prime so the gap re-buffers
+  // silently instead of chopping through it.
   private static let renderCallback: AURenderCallback = {
     (inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData) -> OSStatus in
     let plugin = Unmanaged<SixPagesVoicePlugin>.fromOpaque(inRefCon).takeUnretainedValue()
@@ -598,6 +642,24 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     }
     let buffers = UnsafeMutableAudioBufferListPointer(abl)
     plugin.renderCalls &+= 1
+
+    // Build 3: priming gate. If not yet primed, wait for the cushion. Emit clean
+    // silence and return WITHOUT counting an underrun — this is intentional
+    // buffering, not a starve.
+    if !plugin.primed {
+      if plugin.playback.count >= plugin.primeThresholdBytes {
+        plugin.primed = true   // cushion built; fall through to normal read
+      } else {
+        for buffer in buffers {
+          if let mData = buffer.mData {
+            memset(mData, 0, Int(buffer.mDataByteSize))
+          }
+        }
+        ioActionFlags.pointee.insert(.unitRenderAction_OutputIsSilence)
+        return noErr
+      }
+    }
+
     for buffer in buffers {
       guard let mData = buffer.mData else { continue }
       let bytesRequested = Int(buffer.mDataByteSize)
@@ -606,6 +668,13 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       if provided < bytesRequested {
         plugin.underrunEvents &+= 1
         memset(mData.advanced(by: provided), 0, bytesRequested - provided)
+        // Build 3: a FULL drain (nothing at all provided) on a nonzero request
+        // means the ring emptied mid-stream — a network stall. Re-prime so the
+        // gap re-buffers rather than chopping through the burst gap.
+        if provided == 0 && bytesRequested > 0 {
+          plugin.primed = false
+          plugin.reprimeEvents &+= 1
+        }
       }
     }
     return noErr
