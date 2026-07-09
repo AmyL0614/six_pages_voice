@@ -7,59 +7,116 @@ import os.log
 // ─────────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 1: AUDIO SCAFFOLDING ONLY.
+// STEP B, LAYER 2: RENDER CALLBACK + PLAYBACK RING BUFFER.
 //
-// This layer stands up the echo-cancelling audio unit and proves it compiles
-// and links against the iOS SDK. It does NOT yet move audio:
-//   • start        → configures AVAudioSession, creates the VoiceProcessingIO
-//                     unit, sets 16 kHz mono PCM16 on both buses, enables AEC,
-//                     initializes + starts the unit. Returns true on success.
-//   • stop         → stops + uninitializes + disposes the unit.
-//   • feedPlayback → still accepted and dropped (ring buffer arrives Layer 2).
-//   • capture      → still emits nothing (input callback arrives Layer 3).
+// Builds on Layer 1 (VoiceProcessingIO scaffolding). This layer makes
+// feedPlayback real: Joe's incoming PCM bytes are written into a ring buffer,
+// and a render callback on the OUTPUT bus (bus 0) drains that buffer to the
+// speaker THROUGH the voice-processing unit. Playing through the unit is what
+// makes Joe's audio the echo reference the AEC subtracts automatically — no
+// delay measurement, no alignment math (the OS does it).
 //
-// Design note (deliberate deviation from the July 7 "raw AUGraph" wording):
-// AUGraph was deprecated by Apple at iOS 13, which is our deployment floor.
-// This uses the modern raw AudioUnit C API instead — same architecture, same
-// VoiceProcessingIO subtype, same callbacks and ring buffers in later layers,
-// without building on a deprecated wrapper. The Dart contract is unchanged.
+//   • start        → Layer 1 scaffolding + installs the render callback.
+//   • feedPlayback → writes raw bytes into the playback ring buffer.
+//   • stop         → tears down unit + clears the ring buffer.
+//   • capture      → STILL emits nothing (input callback is Layer 3).
 //
-// Contract (locked from lib/six_pages_voice_method_channel.dart):
-//   MethodChannel "six_pages_voice/control"  → start / stop / feedPlayback
-//   EventChannel  "six_pages_voice/capture"  → captureStream (broadcast)
-//   feedPlayback argument IS raw bytes (FlutterStandardTypedData), not a map.
-//   capture frames: PCM16, 16 kHz, mono.
+// The render callback is a C function pointer and cannot capture Swift context,
+// so it reaches the instance via an Unmanaged pointer passed as inRefCon.
+//
+// Contract (unchanged): MethodChannel "six_pages_voice/control",
+// EventChannel "six_pages_voice/capture", feedPlayback arg is raw bytes
+// (FlutterStandardTypedData), frames PCM16 / 16 kHz / mono.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// MARK: - PlaybackRingBuffer
+//
+// Single-producer (feedPlayback, Dart thread) / single-consumer (render
+// callback, audio thread) byte ring buffer. A lock keeps it correct and simple;
+// the critical sections are tiny (memcpy of a few hundred bytes), well within
+// the render deadline at 16 kHz. If profiling later shows lock contention we can
+// move to a lock-free design, but correctness first.
+private final class PlaybackRingBuffer {
+  private var storage: [UInt8]
+  private let capacity: Int
+  private var readIndex = 0
+  private var writeIndex = 0
+  private var filled = 0
+  private let lock = NSLock()
+
+  init(capacityBytes: Int) {
+    self.capacity = capacityBytes
+    self.storage = [UInt8](repeating: 0, count: capacityBytes)
+  }
+
+  /// Producer: append bytes. If the buffer would overflow, drop the OLDEST
+  /// bytes (advance read) so the freshest audio wins — a late listener should
+  /// hear "now", not a growing backlog.
+  func write(_ bytes: UnsafeRawBufferPointer) {
+    lock.lock(); defer { lock.unlock() }
+    let n = bytes.count
+    guard n > 0 else { return }
+
+    // If more than capacity arrives at once, keep only the last `capacity` bytes.
+    let start = n > capacity ? n - capacity : 0
+    let toCopy = n - start
+
+    for i in 0..<toCopy {
+      storage[writeIndex] = bytes[start + i]
+      writeIndex = (writeIndex + 1) % capacity
+      if filled < capacity {
+        filled += 1
+      } else {
+        // Overwrote unread data: advance read to drop the oldest byte.
+        readIndex = (readIndex + 1) % capacity
+      }
+    }
+  }
+
+  /// Consumer: pull up to `count` bytes into `dest`. Returns bytes actually
+  /// provided; the caller zero-fills any remainder (silence on underrun).
+  func read(into dest: UnsafeMutableRawPointer, count: Int) -> Int {
+    lock.lock(); defer { lock.unlock() }
+    let available = min(count, filled)
+    let d = dest.assumingMemoryBound(to: UInt8.self)
+    for i in 0..<available {
+      d[i] = storage[readIndex]
+      readIndex = (readIndex + 1) % capacity
+      filled -= 1
+    }
+    return available
+  }
+
+  func clear() {
+    lock.lock(); defer { lock.unlock() }
+    readIndex = 0; writeIndex = 0; filled = 0
+  }
+}
 
 public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
   private static let log = OSLog(subsystem: "com.sixpages.six_pages_voice", category: "SixPagesVoice")
 
-  // The one echo-cancelling I/O unit. nil until start() opens it.
   private var ioUnit: AudioUnit?
-
-  // Whether the unit is currently running (guards double start/stop).
   private var isRunning = false
 
-  // Target format for the whole pipeline: 16 kHz, mono, signed 16-bit, packed.
-  // (Layer 1 requests this on both buses; the sample-rate-fallback converter
-  //  that handles a refusal is Layer 4, risk 1.)
   private static let targetSampleRate: Double = 16000.0
 
-  // Held so we can push capture frames up once audio exists (Layer 3).
+  // ~500 ms of 16 kHz mono PCM16 = 16000 * 0.5 * 2 bytes = 16000 bytes.
+  // Headroom for network jitter in Joe's burst delivery; does NOT add fixed
+  // latency (the render drain only holds as much as Joe is ahead by).
+  private static let playbackBufferBytes = 16000
+  private let playback = PlaybackRingBuffer(capacityBytes: playbackBufferBytes)
+
   private var captureSink: FlutterEventSink?
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let messenger = registrar.messenger()
 
     let controlChannel = FlutterMethodChannel(
-      name: "six_pages_voice/control",
-      binaryMessenger: messenger
-    )
+      name: "six_pages_voice/control", binaryMessenger: messenger)
     let captureChannel = FlutterEventChannel(
-      name: "six_pages_voice/capture",
-      binaryMessenger: messenger
-    )
+      name: "six_pages_voice/capture", binaryMessenger: messenger)
 
     let instance = SixPagesVoicePlugin()
     registrar.addMethodCallDelegate(instance, channel: controlChannel)
@@ -76,12 +133,13 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     case "start":
       do {
         try startUnit()
-        os_log("start: VoiceProcessingIO unit running", log: SixPagesVoicePlugin.log, type: .info)
+        os_log("start: VoiceProcessingIO unit running (render installed)",
+               log: SixPagesVoicePlugin.log, type: .info)
         result(true)
       } catch {
         os_log("start: FAILED — %{public}@", log: SixPagesVoicePlugin.log, type: .error,
                String(describing: error))
-        stopUnit() // leave nothing half-open
+        stopUnit()
         result(false)
       }
 
@@ -91,11 +149,10 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       result(nil)
 
     case "feedPlayback":
-      // Contract: the argument is the raw bytes directly (FlutterStandardTypedData).
       if let typed = call.arguments as? FlutterStandardTypedData {
-        // Layer 1: accept and drop. Layer 2 writes typed.data into the playback ring buffer.
-        os_log("feedPlayback: (layer1) received %d bytes, dropping",
-               log: SixPagesVoicePlugin.log, type: .debug, typed.data.count)
+        typed.data.withUnsafeBytes { raw in
+          playback.write(raw)
+        }
         result(nil)
       } else {
         os_log("feedPlayback: BAD ARG — expected FlutterStandardTypedData, got %{public}@",
@@ -110,7 +167,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     }
   }
 
-  // MARK: - Audio unit lifecycle (Layer 1)
+  // MARK: - Audio unit lifecycle
 
   private enum AudioError: Error {
     case session(String)
@@ -118,12 +175,9 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     case noComponent
   }
 
-  /// Builds the AVAudioSession + VoiceProcessingIO unit and starts it.
-  /// No callbacks are installed yet — that is Layers 2 and 3.
   private func startUnit() throws {
     if isRunning { return }
 
-    // 1. Audio session: play + record, prefer the speaker, voice-chat processing.
     let session = AVAudioSession.sharedInstance()
     do {
       try session.setCategory(.playAndRecord,
@@ -135,101 +189,69 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       throw AudioError.session(error.localizedDescription)
     }
 
-    // 2. Describe the VoiceProcessingIO audio unit (Apple's echo canceller).
     var desc = AudioComponentDescription(
       componentType: kAudioUnitType_Output,
       componentSubType: kAudioUnitSubType_VoiceProcessingIO,
       componentManufacturer: kAudioUnitManufacturer_Apple,
-      componentFlags: 0,
-      componentFlagsMask: 0
-    )
+      componentFlags: 0, componentFlagsMask: 0)
 
-    guard let comp = AudioComponentFindNext(nil, &desc) else {
-      throw AudioError.noComponent
-    }
+    guard let comp = AudioComponentFindNext(nil, &desc) else { throw AudioError.noComponent }
 
     var unitOptional: AudioUnit?
-    try checkStatus("AudioComponentInstanceNew",
-                    AudioComponentInstanceNew(comp, &unitOptional))
+    try checkStatus("AudioComponentInstanceNew", AudioComponentInstanceNew(comp, &unitOptional))
     guard let unit = unitOptional else { throw AudioError.noComponent }
     self.ioUnit = unit
 
-    // Audio unit element/bus conventions:
-    //   bus 1 = input  (mic → app)
-    //   bus 0 = output (app → speaker)
     let inputBus: AudioUnitElement = 1
     let outputBus: AudioUnitElement = 0
 
-    // 3. Enable input on the input bus (I/O units default input OFF).
     var enableFlag: UInt32 = 1
     try checkStatus("enable input",
-      AudioUnitSetProperty(unit,
-                           kAudioOutputUnitProperty_EnableIO,
-                           kAudioUnitScope_Input,
-                           inputBus,
-                           &enableFlag,
-                           UInt32(MemoryLayout<UInt32>.size)))
-    // Output is enabled by default; set explicitly for clarity.
+      AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input,
+                           inputBus, &enableFlag, UInt32(MemoryLayout<UInt32>.size)))
     try checkStatus("enable output",
-      AudioUnitSetProperty(unit,
-                           kAudioOutputUnitProperty_EnableIO,
-                           kAudioUnitScope_Output,
-                           outputBus,
-                           &enableFlag,
-                           UInt32(MemoryLayout<UInt32>.size)))
+      AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output,
+                           outputBus, &enableFlag, UInt32(MemoryLayout<UInt32>.size)))
 
-    // 4. Stream format: 16 kHz, mono, signed 16-bit, packed, interleaved.
     var format = AudioStreamBasicDescription(
       mSampleRate: SixPagesVoicePlugin.targetSampleRate,
       mFormatID: kAudioFormatLinearPCM,
       mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-      mBytesPerPacket: 2,
-      mFramesPerPacket: 1,
-      mBytesPerFrame: 2,
-      mChannelsPerFrame: 1,
-      mBitsPerChannel: 16,
-      mReserved: 0
-    )
+      mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2,
+      mChannelsPerFrame: 1, mBitsPerChannel: 16, mReserved: 0)
 
-    // Format the app sees on the mic side (output scope of input bus).
     try checkStatus("set input-bus client format",
-      AudioUnitSetProperty(unit,
-                           kAudioUnitProperty_StreamFormat,
-                           kAudioUnitScope_Output,
-                           inputBus,
-                           &format,
-                           UInt32(MemoryLayout<AudioStreamBasicDescription>.size)))
-    // Format the app supplies on the playback side (input scope of output bus).
+      AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output,
+                           inputBus, &format, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)))
     try checkStatus("set output-bus client format",
-      AudioUnitSetProperty(unit,
-                           kAudioUnitProperty_StreamFormat,
-                           kAudioUnitScope_Input,
-                           outputBus,
-                           &format,
-                           UInt32(MemoryLayout<AudioStreamBasicDescription>.size)))
+      AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input,
+                           outputBus, &format, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)))
 
-    // 5. Explicitly ensure voice processing (AEC) is ON (bypass = 0).
     var bypass: UInt32 = 0
     try checkStatus("AEC on (bypass=0)",
-      AudioUnitSetProperty(unit,
-                           kAUVoiceIOProperty_BypassVoiceProcessing,
-                           kAudioUnitScope_Global,
-                           0,
-                           &bypass,
-                           UInt32(MemoryLayout<UInt32>.size)))
+      AudioUnitSetProperty(unit, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global,
+                           0, &bypass, UInt32(MemoryLayout<UInt32>.size)))
 
-    // NOTE: render + input callbacks are intentionally NOT installed in Layer 1.
-    // Layer 2 installs the render callback (drains playback ring buffer to bus 0).
-    // Layer 3 installs the input callback (pushes AEC'd mic frames to captureSink).
+    // ── Layer 2: install the RENDER callback on the output bus ────────────────
+    // The callback is a C function pointer; it reaches this instance through
+    // inRefCon (an Unmanaged pointer). We pass an unretained pointer — the
+    // plugin outlives the unit, and we dispose the unit in stopUnit() before
+    // the plugin can go away, so there is no dangling reference.
+    var renderCallback = AURenderCallbackStruct(
+      inputProc: SixPagesVoicePlugin.renderCallback,
+      inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
+    try checkStatus("set render callback",
+      AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input,
+                           outputBus, &renderCallback,
+                           UInt32(MemoryLayout<AURenderCallbackStruct>.size)))
 
-    // 6. Initialize + start.
+    playback.clear()
+
     try checkStatus("AudioUnitInitialize", AudioUnitInitialize(unit))
     try checkStatus("AudioOutputUnitStart", AudioOutputUnitStart(unit))
-
     isRunning = true
   }
 
-  /// Stops + tears down the unit. Safe to call repeatedly.
   private func stopUnit() {
     if let unit = ioUnit {
       AudioOutputUnitStop(unit)
@@ -238,18 +260,47 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       ioUnit = nil
     }
     isRunning = false
-    // Deactivate the session so mic/speaker are released for the rest of iOS.
-    try? AVAudioSession.sharedInstance().setActive(false,
-                                                   options: [.notifyOthersOnDeactivation])
+    playback.clear()
+    try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
   }
 
-  /// Turns a non-zero OSStatus into a thrown error with the failing call named.
   private func checkStatus(_ what: String, _ status: OSStatus) throws {
     if status != noErr {
       os_log("audio: %{public}@ failed (OSStatus %d)",
              log: SixPagesVoicePlugin.log, type: .error, what, status)
       throw AudioError.osStatus(what, status)
     }
+  }
+
+  // MARK: - Render callback (C function pointer, audio thread)
+  //
+  // Called by the unit when it needs `inNumberFrames` of playback audio on
+  // bus 0. We drain the ring buffer into the supplied AudioBufferList; any
+  // shortfall is zero-filled (silence) so the unit never plays garbage.
+  // Must not allocate, lock for long, or call Swift runtime-heavy code — the
+  // ring buffer's lock guards a tiny memcpy, which is acceptable here.
+  private static let renderCallback: AURenderCallback = {
+    (inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData) -> OSStatus in
+
+    let plugin = Unmanaged<SixPagesVoicePlugin>.fromOpaque(inRefCon).takeUnretainedValue()
+
+    guard let abl = ioData else {
+      // Nothing to fill; mark silence.
+      ioActionFlags.pointee.insert(.unitRenderAction_OutputIsSilence)
+      return noErr
+    }
+
+    let buffers = UnsafeMutableAudioBufferListPointer(abl)
+    for buffer in buffers {
+      guard let mData = buffer.mData else { continue }
+      let bytesRequested = Int(buffer.mDataByteSize)
+      let provided = plugin.playback.read(into: mData, count: bytesRequested)
+      if provided < bytesRequested {
+        // Zero-fill the remainder → clean silence on underrun, no glitch.
+        memset(mData.advanced(by: provided), 0, bytesRequested - provided)
+      }
+    }
+    return noErr
   }
 }
 
@@ -259,10 +310,8 @@ extension SixPagesVoicePlugin: FlutterStreamHandler {
 
   public func onListen(withArguments arguments: Any?,
                        eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-    // Dart subscribed to captureStream. Hold the sink; Layer 3 feeds AEC'd
-    // frames through it. Layer 1 emits nothing — proving only that it connects.
     self.captureSink = events
-    os_log("capture onListen: stream connected (layer1 — no frames yet)",
+    os_log("capture onListen: stream connected (layer2 — no frames yet)",
            log: SixPagesVoicePlugin.log, type: .info)
     return nil
   }
