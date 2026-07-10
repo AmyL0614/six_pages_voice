@@ -7,46 +7,42 @@ import os.log
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 7 (BUILD 3): PLAYBACK PRIMING (fixes the residual chop).
+// STEP B, LAYER 8 (BUILD 4): LET VPIO RESAMPLE (delete the manual converter).
 //
-// CONFIRMED by Build 2 on-device diagnostics (iPad):
-//   granted=48000Hz [MISMATCH (converter needed)]; ioBuf=0.0233s;
-//   feedConv=16k→48000k; input-bus client (mic→app)=16000Hz/1ch;
-//   output-bus client (app→spk)=48000Hz/1ch;
-//   renderCalls=579; underruns=513 (89% UNDERRUN); lastReqBytes=2208; lastInputFrames=368
+// CONFIRMED by Build 3 on-device diagnostics (iPad):
+//   granted=48000Hz; feedConv=16k→48000Hz; output-bus client=48000Hz/1ch;
+//   renderCalls=624; underruns=8 (1.3% — priming SOLVED the starve);
+//   primed=false; reprimes=4; primeThresh=9600B
+//   BY EAR: still finely choppy, words not intelligible.
 //
-// Build 2 verdict: the 16k→48k converter WORKS and the output bus took 48 kHz
-// (both new markers present, confirmed on device). Yet underruns stayed at 89%.
-// So the fix worked on the axis it targeted (rate), but the chop has a SECOND
-// cause on a different axis (timing), which Build 2 did not address.
+// The verdict that forced this build: Build 3 drove underruns from 89% → 1.3%,
+// so the ring is NO LONGER starving — yet the chop survived almost intact. When
+// the measured cause is fixed and the symptom stays, the cause was misattributed.
+// The chop is in the AUDIO ITSELF, not the buffer timing.
 //
-// Root cause (Build 3, now certain): there is NO JITTER BUFFER / PRE-ROLL.
-// The render callback pulls ~2208 bytes every ~23 ms starting from the FIRST
-// callback. Joe arrives from ElevenLabs in network-paced BURSTS, not a smooth
-// stream. So the ring's `filled` sits below `bytesRequested` on most pulls →
-// zero-fill → chop. The 500 ms ring has the ROOM; nothing ever WAITS for it to
-// fill before draining begins. Correct rate ≠ smooth delivery.
+// Root cause (now researched, Apple Developer Forums thread/20187 + 104550 +
+// 71817): VoiceProcessingIO RESAMPLES INTERNALLY. If you set a 16 kHz client
+// format on the output bus, the unit converts 16k→hardware (48k) itself, with
+// Apple's own continuous resampler. Build 2 added an AVAudioConverter to do this
+// manually — but we ran it PER ElevenLabs CHUNK, with a one-shot input block and
+// no state carried across chunks. That injects a discontinuity at EVERY chunk
+// boundary → an even, periodic chop that garbles words. The converter WAS the chop.
 //
-// FIX (this build): prime the playback ring before letting render consume it.
-//   1. `primed` flag + `primeThresholdBytes` (~100 ms at hwRate). While NOT
-//      primed, the render callback outputs clean silence and DOES NOT count an
-//      underrun (priming is not starving). It flips to primed once the ring has
-//      built the cushion, then reads normally.
-//   2. Re-prime on a full drain: if a normal read returns 0 bytes on a nonzero
-//      request (a mid-stream network stall emptied the ring), drop back to
-//      unprimed and bump `reprimeEvents`, so the gap re-buffers silently instead
-//      of chopping through it.
-//   3. Diagnostics extended: primed / reprimes / primeThresh are appended so the
-//      next device readout PROVES the cushion filled and underruns collapsed.
+// FIX (this build): stop fighting the OS. Do what the forums document:
+//   1. Set the OUTPUT-bus client format back to 16000 Hz (like Build 1).
+//   2. DELETE the AVAudioConverter path entirely. Feed Joe's raw 16 kHz bytes
+//      straight to the playback ring — no per-chunk conversion, no seams.
+//   3. The unit resamples 16k→48k continuously on the way to the speaker.
+//   4. KEEP the Build 3 priming gate — it was real and correct (89% → 1.3%).
+//      Priming is orthogonal to the converter; it stays exactly as-is.
 //
-// TRADE-OFF (explicit, decide-first): priming adds ~100 ms of latency before
-// Joe's first audio. For a companion voice this is the right trade — 100 ms is
-// imperceptible in conversation; chop is not. If a device test shows underruns
-// gone but latency too long, lower primeThresholdBytes; if bursts are choppier
-// than 100 ms absorbs, raise it. The diagnostic string tells us which.
+// If this device happens to REJECT a 16 kHz output client format,
+// AudioUnitInitialize throws and start() fails loudly (we'll see it) — but the
+// forum consensus is 16 kHz client formats are accepted and resampled. This is
+// the documented happy path, not a hack.
 //
-// CONVERTER (Build 2) and CAPTURE are UNTOUCHED. The transcript proved capture
-// clean; Build 2 proved the converter runs. We change ONLY the playback timing.
+// CAPTURE is UNTOUCHED (transcript proved it clean). Input bus stays 16 kHz —
+// which it always was; only the OUTPUT bus changes back from 48k to 16k.
 // ───────────────────────────────────────────────────────────────────────────
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
@@ -213,14 +209,10 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   fileprivate var primeThresholdBytes = 0   // set in startUnit from hwRate (~100 ms)
   fileprivate var reprimeEvents = 0
 
-  // Build 2: actual hardware sample rate read at start (e.g. 48000). The output
-  // (playback) bus is formatted to this; Joe's 16 kHz feed is upsampled to it.
+  // Build 4: actual hardware sample rate read at start (e.g. 48000), kept ONLY
+  // for the diagnostic string. Playback no longer converts to it — the output
+  // bus is 16 kHz and VoiceProcessingIO resamples 16k→hardware internally.
   private var hwRate: Double = SixPagesVoicePlugin.targetSampleRate
-  // Build 2: converter that resamples Joe 16 kHz mono PCM16 → hwRate mono PCM16.
-  // nil when hwRate == 16000 (no conversion needed — best case).
-  private var feedConverter: AVAudioConverter?
-  private var feedInFormat: AVAudioFormat?
-  private var feedOutFormat: AVAudioFormat?
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let messenger = registrar.messenger()
@@ -268,15 +260,10 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
     case "feedPlayback":
       if let typed = call.arguments as? FlutterStandardTypedData {
-        // Build 2: if hardware != 16 kHz, upsample Joe 16k→hwRate before the ring
-        // so feed-rate matches the render callback's consume-rate. If no converter
-        // (hwRate == 16k), write straight through as before.
-        if feedConverter != nil {
-          let upsampled = convertFeed(typed.data)
-          upsampled.withUnsafeBytes { raw in playback.write(raw) }
-        } else {
-          typed.data.withUnsafeBytes { raw in playback.write(raw) }
-        }
+        // Build 4: write Joe's raw 16 kHz PCM16 straight to the ring. NO manual
+        // conversion — the output bus is 16 kHz and VoiceProcessingIO resamples
+        // 16k→hardware internally, continuously, with no chunk-boundary seams.
+        typed.data.withUnsafeBytes { raw in playback.write(raw) }
         result(nil)
       } else {
         result(FlutterError(code: "BAD_ARG",
@@ -332,41 +319,16 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     lastDiagnostics = "granted=\(Int(grantedRate))Hz [\(rateVerdict)]; "
       + "ioBuf=\(String(format: "%.4f", ioBufDuration))s; "
 
-    // ── Build 2: adopt the real hardware rate for the playback path ──────────
-    // The render callback is driven by the hardware clock (grantedRate). We make
-    // the output-bus client format match it, and upsample Joe's 16 kHz feed to it.
+    // ── Build 4: no manual conversion. Record hwRate for diagnostics only. ────
+    // The output bus is set to 16 kHz (below); VoiceProcessingIO resamples
+    // 16k→hardware internally. Joe's feed enters the ring as raw 16 kHz bytes.
     hwRate = grantedRate
-    if abs(hwRate - SixPagesVoicePlugin.targetSampleRate) < 1.0 {
-      // Hardware honored 16 kHz — no conversion needed.
-      feedConverter = nil
-      feedInFormat = nil
-      feedOutFormat = nil
-    } else {
-      // Build the Joe 16 kHz → hwRate converter (mono, Int16, interleaved).
-      let inFmt = AVAudioFormat(commonFormat: .pcmFormatInt16,
-                               sampleRate: SixPagesVoicePlugin.targetSampleRate,
-                               channels: 1, interleaved: true)
-      let outFmt = AVAudioFormat(commonFormat: .pcmFormatInt16,
-                                sampleRate: hwRate,
-                                channels: 1, interleaved: true)
-      if let inFmt = inFmt, let outFmt = outFmt,
-         let conv = AVAudioConverter(from: inFmt, to: outFmt) {
-        feedInFormat = inFmt
-        feedOutFormat = outFmt
-        feedConverter = conv
-        lastDiagnostics += "feedConv=16k→\(Int(hwRate))Hz; "
-      } else {
-        os_log("Build2: FAILED to build feed converter 16k→%{public}.0f",
-               log: SixPagesVoicePlugin.log, type: .error, hwRate)
-        lastDiagnostics += "feedConv=BUILD_FAILED; "
-        feedConverter = nil
-      }
-    }
+    lastDiagnostics += "playbackPath=VPIO-internal-resample(16k→\(Int(hwRate))Hz); "
 
-    // ── Build 3: compute the priming cushion (~100 ms at the real hardware rate).
-    // 100 ms of hwRate mono PCM16 = hwRate * 2 bytes * 0.1. At 48 kHz → 9600 B.
-    // Capped to half the ring so we can never demand more than the ring can hold.
-    let hundredMs = Int(hwRate * 2.0 * 0.1)
+    // ── Build 3: compute the priming cushion (~100 ms). Playback is now 16 kHz
+    // (the render callback consumes 16 kHz bytes; the unit resamples downstream),
+    // so the cushion is 100 ms of 16 kHz mono PCM16 = 16000 * 2 * 0.1 = 3200 B.
+    let hundredMs = Int(SixPagesVoicePlugin.targetSampleRate * 2.0 * 0.1)
     primeThresholdBytes = min(hundredMs, SixPagesVoicePlugin.playbackBufferBytes / 2)
     primed = false
     reprimeEvents = 0
@@ -404,11 +366,12 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2,
       mChannelsPerFrame: 1, mBitsPerChannel: 16, mReserved: 0)
 
-    // Output bus (app → speaker): Build 2 — use the REAL hardware rate so the
-    // render callback's frame math matches the clock it's driven by. Joe's feed
-    // is upsampled to this rate in feedPlayback.
+    // Output bus (app → speaker): Build 4 — set 16 kHz CLIENT format. The unit
+    // accepts it and resamples 16k→hardware(48k) internally and continuously.
+    // This is the documented VPIO behavior (Apple Dev Forums thread/20187): as
+    // long as the AU doesn't reject the format, rate conversion is automatic.
     var outFormat = AudioStreamBasicDescription(
-      mSampleRate: hwRate,
+      mSampleRate: SixPagesVoicePlugin.targetSampleRate,
       mFormatID: kAudioFormatLinearPCM,
       mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
       mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2,
@@ -489,10 +452,6 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     isRunning = false
     playback.clear()
     capture.clear()
-    // Build 2: release converter refs.
-    feedConverter = nil
-    feedInFormat = nil
-    feedOutFormat = nil
     // Build 3: reset priming state so a fresh session re-primes cleanly.
     primed = false
     if let scratch = captureScratch {
@@ -539,64 +498,6 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
              log: SixPagesVoicePlugin.log, type: .error, what, status)
       throw AudioError.osStatus(what, status)
     }
-  }
-
-  // Build 2: resample Joe's 16 kHz mono PCM16 bytes up to hwRate mono PCM16.
-  // Returns the converted bytes (Data). Called from feedPlayback (Dart thread),
-  // not the audio thread, so an allocation-per-call is acceptable here.
-  private func convertFeed(_ input16k: Data) -> Data {
-    guard let conv = feedConverter,
-          let inFmt = feedInFormat,
-          let outFmt = feedOutFormat,
-          !input16k.isEmpty else {
-      return input16k
-    }
-
-    let bytesPerFrame = 2 // Int16 mono
-    let inFrameCount = AVAudioFrameCount(input16k.count / bytesPerFrame)
-    guard inFrameCount > 0,
-          let inBuf = AVAudioPCMBuffer(pcmFormat: inFmt, frameCapacity: inFrameCount) else {
-      return input16k
-    }
-    inBuf.frameLength = inFrameCount
-
-    // Copy Joe's bytes into the input buffer's Int16 channel.
-    input16k.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
-      if let dst = inBuf.int16ChannelData?[0] {
-        memcpy(dst, src.baseAddress!, Int(inFrameCount) * bytesPerFrame)
-      }
-    }
-
-    // Output capacity: ceil(inFrames * hwRate/16000) + slack.
-    let ratio = hwRate / SixPagesVoicePlugin.targetSampleRate
-    let outCap = AVAudioFrameCount(Double(inFrameCount) * ratio + 8)
-    guard let outBuf = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: outCap) else {
-      return input16k
-    }
-
-    var fed = false
-    var convError: NSError?
-    let status = conv.convert(to: outBuf, error: &convError) { _, outStatus in
-      if fed {
-        outStatus.pointee = .noDataNow
-        return nil
-      }
-      fed = true
-      outStatus.pointee = .haveData
-      return inBuf
-    }
-
-    if status == .error || convError != nil {
-      os_log("Build2: convertFeed error -> %{public}@", log: SixPagesVoicePlugin.log,
-             type: .error, String(describing: convError))
-      return input16k
-    }
-
-    let outFrames = Int(outBuf.frameLength)
-    guard outFrames > 0, let outData = outBuf.int16ChannelData?[0] else {
-      return input16k
-    }
-    return Data(bytes: outData, count: outFrames * bytesPerFrame)
   }
 
   /// Layer 4: read back and log the format the unit actually negotiated on a
