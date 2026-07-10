@@ -8,34 +8,25 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 10 (BUILD 6): LOCK-FREE PLAYBACK RING (the real chop fix).
+// STEP B, LAYER 11 (BUILD 7): 30s RING + DROPPED-BYTES DIAGNOSTIC.
 //
-// CONFIRMED by Build 5 on-device diagnostics (iPad):
-//   full-turn ring (480000 B); underruns low; reprimes rare; yet BY EAR: choppy
-//   WHILE ElevenLabs streamed a turn, and it SMOOTHED OUT once the stream ended.
+// CONFIRMED by Build 6 on-device diagnostics (iPad):
+//   lock-free ring live; underruns=6/3800 (0.16% — buffer NOT starving);
+//   reprimes=3. BY EAR: Joe STARTS great, then STUMBLES mid and later in the turn.
 //
-// That specific pattern — glitchy only during active writes, clean once writes
-// stop — is the textbook signature of PRIORITY INVERSION from taking a lock on
-// the real-time audio thread (Ross Bencina "Real-time audio programming 101";
-// Timur Doumler; Android audio docs, which name "repeated audio when circular
-// buffers are used" + dropouts as its symptoms). The render callback grabbed the
-// ring's NSLock; while feedPlayback held that lock during streaming, the audio
-// thread BLOCKED past its ~23 ms deadline → silence/skip. Builds 3 & 5 (bigger
-// cushion, bigger ring) only MASKED it — Android's docs say enlarging buffers
-// hides priority inversion rather than fixing it. The cure: the audio thread must
-// NEVER block.
+// The lock-free ring (Build 6) removed priority inversion and fixed the bulk of
+// the chop — near-zero underruns prove the buffer no longer starves. But "starts
+// great, stumbles mid/late" with a healthy buffer is the signature of OVERFLOW,
+// not underflow: the ring is empty at turn start (smooth), but ElevenLabs feeds
+// FASTER than realtime, so by mid-turn the 15 s ring hits its ceiling and the
+// drop-newest overflow discards Joe's later audio → gaps mid and late. The start
+// is always clean because the ring hasn't filled yet.
 //
-// FIX (this build): replace the lock-guarded ring with a LOCK-FREE single-
-// producer/single-consumer ring (atomic acquire/release indices). The render
-// callback never waits on the writer; it always makes progress within deadline.
-// See the ByteRingBuffer comment for the full design + why Android didn't need
-// this (it writes to an OS AudioTrack with no app-side render callback, but iOS
-// must feed the VoiceProcessingIO callback so playback routes through AEC).
-//
-// Overflow policy changed drop-OLDEST → drop-NEWEST to preserve SPSC safety
-// (drop-oldest needed the producer to move readIndex). With the 15 s ring this
-// never triggers for a normal turn. Everything else (VPIO 16k internal resample,
-// priming gate, full-turn ring, diagnostics, capture) is UNCHANGED.
+// FIX (this build): (1) enlarge the ring to hold the LONGEST turn — 30 s (960000 B)
+// — so it no longer fills mid-turn; (2) add a droppedBytes counter to the
+// diagnostic so the next test PROVES whether overflow still occurs (droppedBytes=0
+// → solved; > 0 → ring still too small, raise further). Everything else (lock-free
+// SPSC ring, VPIO 16k resample, priming, capture) is UNCHANGED.
 // ───────────────────────────────────────────────────────────────────────────
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
@@ -108,18 +99,29 @@ private final class ByteRingBuffer {
   private let writeIndex: UnsafeMutablePointer<Int>
   private let readIndex: UnsafeMutablePointer<Int>
 
+  // Build 7: total bytes DROPPED because the ring was full when a write arrived
+  // (drop-newest overflow). Producer-only writes; read for diagnostics. If this is
+  // > 0 after a turn, the ring filled mid-turn and discarded Joe's later audio —
+  // the direct measure of "starts great, stumbles mid/late." Plain counter (coarse
+  // diagnostic, not correctness-critical).
+  private let droppedBytesPtr: UnsafeMutablePointer<Int>
+  var droppedBytes: Int { return droppedBytesPtr.pointee }
+
   init(capacityBytes: Int) {
     self.capacity = capacityBytes
     self.storage = [UInt8](repeating: 0, count: capacityBytes)
     self.writeIndex = UnsafeMutablePointer<Int>.allocate(capacity: 1)
     self.readIndex = UnsafeMutablePointer<Int>.allocate(capacity: 1)
+    self.droppedBytesPtr = UnsafeMutablePointer<Int>.allocate(capacity: 1)
     self.writeIndex.initialize(to: 0)
     self.readIndex.initialize(to: 0)
+    self.droppedBytesPtr.initialize(to: 0)
   }
 
   deinit {
     writeIndex.deinitialize(count: 1); writeIndex.deallocate()
     readIndex.deinitialize(count: 1); readIndex.deallocate()
+    droppedBytesPtr.deinitialize(count: 1); droppedBytesPtr.deallocate()
   }
 
   // Bytes currently available to read. Safe to call from either thread.
@@ -161,8 +163,12 @@ private final class ByteRingBuffer {
     let r = _load(readIndex)            // acquire the consumer's progress
     let used = w - r
     let free = capacity - used
-    if free <= 0 { return }             // full: drop newest, never touch readIndex
+    if free <= 0 {
+      droppedBytesPtr.pointee += n   // fully full: entire write dropped
+      return
+    }
     let toCopy = min(n, free)
+    if toCopy < n { droppedBytesPtr.pointee += (n - toCopy) } // partial drop
     var wi = w % capacity
     for i in 0..<toCopy {
       storage[wi] = src[i]
@@ -215,6 +221,7 @@ private final class ByteRingBuffer {
   func clear() {
     _store(writeIndex, 0)
     _store(readIndex, 0)
+    droppedBytesPtr.pointee = 0
   }
 }
 
@@ -230,18 +237,17 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // Frame contract (mirrors Android): 640 bytes = 20 ms of 16 kHz mono PCM16.
   private static let frameBytes = 640
 
-  // Playback ring: Build 5 — sized to hold a WHOLE TURN of Joe's audio, not a
-  // small jitter cushion. ElevenLabs synthesizes a full turn in a few seconds
-  // and streams it to us FASTER than realtime, while the render callback drains
-  // at natural speech rate. With the old 1.5s ring, feed outran drain within the
-  // first couple seconds of every turn and the drop-OLDEST overflow policy
-  // (see ByteRingBuffer.write) overwrote un-played audio → later words stomped on
-  // earlier words → "sentences piling on top of each other." Holding a full turn
-  // means feed never overwrites un-played audio; the callback drains it smoothly
-  // start to finish. 15 s of 16 kHz mono PCM16 = 16000 * 2 * 15 = 480000 B
-  // (~469 KB — trivial). Reflections don't run 15 s in one unbroken burst; raise
-  // if a very long single-burst turn ever overflows again.
-  private static let playbackBufferBytes = 480000
+  // Playback ring: Build 7 — sized to hold the LONGEST turn (Joe's session
+  // summary is the worst case) without overflowing. ElevenLabs delivers a turn
+  // FASTER than realtime, so a ring smaller than the turn fills mid-turn and the
+  // drop-newest overflow discards Joe's later audio → "starts great, stumbles
+  // mid/late." Build 5's 15 s (480000 B) filled mid-turn on longer replies.
+  // 30 s of 16 kHz mono PCM16 = 16000 * 2 * 30 = 960000 B (~938 KB — trivial).
+  // The droppedBytes diagnostic will confirm whether 30 s is enough; if a turn
+  // ever exceeds it, raise again (reflections are bounded, so a finite ring is
+  // the right practical fix — true backpressure isn't feasible over the fire-
+  // and-forget method channel).
+  private static let playbackBufferBytes = 960000
   private let playback = ByteRingBuffer(capacityBytes: playbackBufferBytes)
 
   // Capture ring: ~500 ms of clean mic audio waiting to drain up to Dart.
@@ -327,7 +333,8 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // prove the cushion filled and underruns collapsed toward 0.
       let live = "renderCalls=\(renderCalls); underruns=\(underrunEvents); "
         + "lastReqBytes=\(lastRenderBytesRequested); lastInputFrames=\(lastInputFrames); "
-        + "primed=\(primed); reprimes=\(reprimeEvents); primeThresh=\(primeThresholdBytes)B"
+        + "primed=\(primed); reprimes=\(reprimeEvents); primeThresh=\(primeThresholdBytes)B; "
+        + "droppedBytes=\(playback.droppedBytes)"
       result(lastDiagnostics + live)
 
     case "feedPlayback":
