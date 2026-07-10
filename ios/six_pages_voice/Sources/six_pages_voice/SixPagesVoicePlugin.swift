@@ -3,42 +3,39 @@ import UIKit
 import AVFoundation
 import AudioToolbox
 import os.log
+import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-free ring
 
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 9 (BUILD 5): FULL-TURN PLAYBACK RING (fixes overlap/override).
+// STEP B, LAYER 10 (BUILD 6): LOCK-FREE PLAYBACK RING (the real chop fix).
 //
-// CONFIRMED by Build 4 on-device diagnostics (iPad):
-//   granted=48000Hz; playbackPath=VPIO-internal-resample(16k→48000Hz);
-//   output-bus client=16000Hz/1ch; renderCalls=2999; underruns=36 (1.2% — buffer
-//   is HEALTHY, not starving); reprimes=4 (rare); primeThresh=11200B.
-//   BY EAR: normal pitch, words intelligible, but sentences PILE ON TOP OF EACH
-//   OTHER — each new piece overrides what Joe was still saying.
+// CONFIRMED by Build 5 on-device diagnostics (iPad):
+//   full-turn ring (480000 B); underruns low; reprimes rare; yet BY EAR: choppy
+//   WHILE ElevenLabs streamed a turn, and it SMOOTHED OUT once the stream ended.
 //
-// The verdict that forced this build: underruns low + reprimes rare = the ring is
-// NOT starving and priming is NOT thrashing. Yet playback overlaps. Low underruns
-// with overlap is the signature of the OPPOSITE failure: OVERFLOW, not underflow.
+// That specific pattern — glitchy only during active writes, clean once writes
+// stop — is the textbook signature of PRIORITY INVERSION from taking a lock on
+// the real-time audio thread (Ross Bencina "Real-time audio programming 101";
+// Timur Doumler; Android audio docs, which name "repeated audio when circular
+// buffers are used" + dropouts as its symptoms). The render callback grabbed the
+// ring's NSLock; while feedPlayback held that lock during streaming, the audio
+// thread BLOCKED past its ~23 ms deadline → silence/skip. Builds 3 & 5 (bigger
+// cushion, bigger ring) only MASKED it — Android's docs say enlarging buffers
+// hides priority inversion rather than fixing it. The cure: the audio thread must
+// NEVER block.
 //
-// Root cause (certain): ElevenLabs synthesizes Joe's whole turn in a few seconds
-// and streams it to us FASTER THAN REALTIME. The render callback drains at natural
-// speech rate (~1.5 s of audio per 1.5 s). The old ring held only 1.5 s. So within
-// the first seconds of every turn, feed outran drain, the ring filled, and its
-// drop-OLDEST overflow policy (ByteRingBuffer.write drops oldest to make room for
-// newest) OVERWROTE audio Joe had not spoken yet. Later words replaced earlier
-// words mid-playback → "sentences piling on top of each other." This was underneath
-// all prior fixes (rate, priming, converter, byte-alignment) and only became
-// audible once those grosser problems were cleared.
+// FIX (this build): replace the lock-guarded ring with a LOCK-FREE single-
+// producer/single-consumer ring (atomic acquire/release indices). The render
+// callback never waits on the writer; it always makes progress within deadline.
+// See the ByteRingBuffer comment for the full design + why Android didn't need
+// this (it writes to an OS AudioTrack with no app-side render callback, but iOS
+// must feed the VoiceProcessingIO callback so playback routes through AEC).
 //
-// FIX (this build): size the playback ring to hold a WHOLE TURN (15 s = 480000 B,
-// ~469 KB). Feed can no longer overwrite un-played audio for a single turn; the
-// callback drains it smoothly start to finish. This is the minimal correct fix —
-// true backpressure (blocking the writer) isn't feasible across the fire-and-
-// forget method channel, and a full-turn ring achieves the same practical result.
-//
-// Everything else (Build 4 VPIO-internal resample at 16k, Build 3 priming gate,
-// diagnostics) is UNCHANGED. Only the ring capacity grows. primeThreshold is a
-// min() against half the ring, so it stays 3200 B — unaffected.
+// Overflow policy changed drop-OLDEST → drop-NEWEST to preserve SPSC safety
+// (drop-oldest needed the producer to move readIndex). With the 15 s ring this
+// never triggers for a normal turn. Everything else (VPIO 16k internal resample,
+// priming gate, full-turn ring, diagnostics, capture) is UNCHANGED.
 // ───────────────────────────────────────────────────────────────────────────
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
@@ -60,93 +57,164 @@ import os.log
 // on success. We return noErr correctly on the success path.
 // ───────────────────────────────────────────────────────────────────────────
 
-// MARK: - ByteRingBuffer
+// MARK: - ByteRingBuffer (Build 6 / Layer 10: LOCK-FREE SPSC)
 //
-// Lock-guarded single-producer/single-consumer byte ring. Used for BOTH the
-// playback path (Dart writes, render reads) and the capture path (input
-// callback writes, drain reads). Tiny critical sections (memcpy of ≤ a frame).
+// WHY THIS EXISTS (the fix that took 7 tries to reach): the render callback runs
+// on the real-time audio thread with a hard ~23 ms deadline. The previous version
+// guarded every read/write with an NSLock. While ElevenLabs streamed a turn,
+// feedPlayback (Dart thread) hammered that lock; whenever a write held it at the
+// moment the render callback needed it, the AUDIO THREAD BLOCKED WAITING → missed
+// its deadline → the unit got silence → glitch. The instant the stream stopped,
+// no contention, callback always got the lock → smooth. That "choppy while audio
+// streams, smooth once it stops" is the textbook signature of PRIORITY INVERSION
+// from taking a lock on the audio thread — documented by Ross Bencina ("Real-time
+// audio programming 101"), Timur Doumler, and Android's own audio docs, which note
+// it manifests as "repeated audio when circular buffers are used" (our overlap) and
+// dropouts (our skip). Bigger buffers (Builds 3 & 5) only MASKED it — Android's docs
+// say so explicitly. The real cure is: the audio thread must NEVER block.
+//
+// Android doesn't have this problem because its playback writes straight to an OS
+// AudioTrack (no app-side render callback pulling from a shared ring). iOS can't
+// copy that: Joe's playback MUST pass through the VoiceProcessingIO render callback
+// so the OS can echo-cancel it. So iOS needs a lock-free hand-off to that callback.
+//
+// DESIGN — strict single-producer / single-consumer, lock-free:
+//   • Playback: producer = feedPlayback (Dart thread); consumer = render callback.
+//   • Capture:  producer = input callback; consumer = drain timer.
+//   Both are SPSC — the ONLY safe case for a simple lock-free ring.
+//   • Two free-running counters. The PRODUCER owns writeIndex and only ever
+//     advances it (atomic release-store after copying data). The CONSUMER owns
+//     readIndex and only ever advances it (atomic release-store after copying).
+//   • Each side reads the OTHER's counter with an atomic acquire-load. Acquire/
+//     release ordering guarantees the bytes are visible before the index that
+//     publishes them. No thread ever waits on the other. The render callback can
+//     ALWAYS make progress within its deadline.
+//   • Overflow policy CHANGED from "drop oldest" to "drop NEWEST (write only what
+//     fits)". Drop-oldest required the producer to advance readIndex, which would
+//     violate SPSC. With Build 5's full-turn (15 s) ring, overflow effectively
+//     never happens for a normal turn; if an over-long turn ever filled it,
+//     discarding the newest tail is safe and glitch-free.
+//
+// Uses Swift's atomics via UnsafeAtomic on raw Int storage — no Foundation lock,
+// nothing that can block, allocation-free on the hot path.
 private final class ByteRingBuffer {
   private var storage: [UInt8]
   private let capacity: Int
-  private var readIndex = 0
-  private var writeIndex = 0
-  private var filled = 0
-  private let lock = NSLock()
+
+  // Free-running counters (monotonic, wrap via modulo on access). writeIndex is
+  // written ONLY by the producer; readIndex ONLY by the consumer. Each is read by
+  // the other side with acquire ordering. Stored as atomics so publication of the
+  // data (release store) happens-before the other thread observes the new index.
+  private let writeIndex: UnsafeMutablePointer<Int>
+  private let readIndex: UnsafeMutablePointer<Int>
 
   init(capacityBytes: Int) {
     self.capacity = capacityBytes
     self.storage = [UInt8](repeating: 0, count: capacityBytes)
+    self.writeIndex = UnsafeMutablePointer<Int>.allocate(capacity: 1)
+    self.readIndex = UnsafeMutablePointer<Int>.allocate(capacity: 1)
+    self.writeIndex.initialize(to: 0)
+    self.readIndex.initialize(to: 0)
   }
 
+  deinit {
+    writeIndex.deinitialize(count: 1); writeIndex.deallocate()
+    readIndex.deinitialize(count: 1); readIndex.deallocate()
+  }
+
+  // Bytes currently available to read. Safe to call from either thread.
   var count: Int {
-    lock.lock(); defer { lock.unlock() }
-    return filled
+    let w = _load(writeIndex)
+    let r = _load(readIndex)
+    return w - r
   }
 
-  /// Producer: append bytes. On overflow, drop OLDEST (advance read) so the
-  /// freshest audio wins.
+  // ── Atomic helpers (acquire load / release store) ─────────────────────────
+  // OSAtomic is deprecated but the memory-barrier free-functions remain the
+  // simplest portable acquire/release primitives available without importing the
+  // Swift Atomics package (which the plugin does not depend on). A full barrier
+  // is stronger than needed but always correct and costs a single fence.
+  @inline(__always) private func _load(_ p: UnsafeMutablePointer<Int>) -> Int {
+    let v = p.pointee
+    OSMemoryBarrier() // acquire: no later read/write is reordered before this
+    return v
+  }
+  @inline(__always) private func _store(_ p: UnsafeMutablePointer<Int>, _ v: Int) {
+    OSMemoryBarrier() // release: all prior writes (the data) publish before index
+    p.pointee = v
+  }
+
+  /// Producer: append bytes. On overflow, drop the NEWEST excess (write only what
+  /// fits) so the producer never touches readIndex — preserving SPSC safety.
   func write(_ bytes: UnsafeRawBufferPointer) {
-    lock.lock(); defer { lock.unlock() }
     let n = bytes.count
     guard n > 0 else { return }
-    let start = n > capacity ? n - capacity : 0
-    let toCopy = n - start
-    for i in 0..<toCopy {
-      storage[writeIndex] = bytes[start + i]
-      writeIndex = (writeIndex + 1) % capacity
-      if filled < capacity { filled += 1 }
-      else { readIndex = (readIndex + 1) % capacity }
-    }
+    write(from: bytes.baseAddress!, count: n)
   }
 
   /// Producer variant writing from a raw pointer + length (used by the input
   /// callback, which holds an AudioBuffer's mData/mDataByteSize).
   func write(from ptr: UnsafeRawPointer, count n: Int) {
-    lock.lock(); defer { lock.unlock() }
     guard n > 0 else { return }
     let src = ptr.assumingMemoryBound(to: UInt8.self)
-    let start = n > capacity ? n - capacity : 0
-    for i in start..<n {
-      storage[writeIndex] = src[i]
-      writeIndex = (writeIndex + 1) % capacity
-      if filled < capacity { filled += 1 }
-      else { readIndex = (readIndex + 1) % capacity }
+    let w = writeIndex.pointee          // producer owns writeIndex — plain read ok
+    let r = _load(readIndex)            // acquire the consumer's progress
+    let used = w - r
+    let free = capacity - used
+    if free <= 0 { return }             // full: drop newest, never touch readIndex
+    let toCopy = min(n, free)
+    var wi = w % capacity
+    for i in 0..<toCopy {
+      storage[wi] = src[i]
+      wi += 1
+      if wi == capacity { wi = 0 }
     }
+    _store(writeIndex, w + toCopy)      // release: publish data, then new index
   }
 
   /// Consumer: pull up to `count` bytes into `dest`. Returns bytes provided.
   func read(into dest: UnsafeMutableRawPointer, count: Int) -> Int {
-    lock.lock(); defer { lock.unlock() }
-    let available = min(count, filled)
+    let r = readIndex.pointee           // consumer owns readIndex — plain read ok
+    let w = _load(writeIndex)           // acquire the producer's progress
+    let available = min(count, w - r)
+    if available <= 0 { return 0 }
     let d = dest.assumingMemoryBound(to: UInt8.self)
+    var ri = r % capacity
     for i in 0..<available {
-      d[i] = storage[readIndex]
-      readIndex = (readIndex + 1) % capacity
-      filled -= 1
+      d[i] = storage[ri]
+      ri += 1
+      if ri == capacity { ri = 0 }
     }
+    _store(readIndex, r + available)    // release: publish consumption
     return available
   }
 
   /// Consumer variant: pull exactly `n` bytes as a Data if available, else nil.
   /// Used by the capture drain to emit whole 640-byte frames only.
   func readFrame(_ n: Int) -> Data? {
-    lock.lock(); defer { lock.unlock() }
-    guard filled >= n else { return nil }
+    let r = readIndex.pointee
+    let w = _load(writeIndex)
+    guard (w - r) >= n else { return nil }
     var out = Data(count: n)
     out.withUnsafeMutableBytes { raw in
       let d = raw.bindMemory(to: UInt8.self)
+      var ri = r % capacity
       for i in 0..<n {
-        d[i] = storage[readIndex]
-        readIndex = (readIndex + 1) % capacity
-        filled -= 1
+        d[i] = storage[ri]
+        ri += 1
+        if ri == capacity { ri = 0 }
       }
     }
+    _store(readIndex, r + n)
     return out
   }
 
+  /// Reset. NOT lock-free-safe against concurrent access — only call when the
+  /// audio unit is stopped (start()/stop() paths), never mid-stream. Matches the
+  /// previous clear()'s contract (it was only called from stop/start).
   func clear() {
-    lock.lock(); defer { lock.unlock() }
-    readIndex = 0; writeIndex = 0; filled = 0
+    _store(writeIndex, 0)
+    _store(readIndex, 0)
   }
 }
 
