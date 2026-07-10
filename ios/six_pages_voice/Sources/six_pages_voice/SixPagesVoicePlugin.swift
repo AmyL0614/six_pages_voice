@@ -8,25 +8,34 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 11 (BUILD 7): 30s RING + DROPPED-BYTES DIAGNOSTIC.
+// STEP B, LAYER 12 (BUILD 8): memcpy COPIES + RENDER-TIME DIAGNOSTIC.
 //
-// CONFIRMED by Build 6 on-device diagnostics (iPad):
-//   lock-free ring live; underruns=6/3800 (0.16% — buffer NOT starving);
-//   reprimes=3. BY EAR: Joe STARTS great, then STUMBLES mid and later in the turn.
+// CONFIRMED by Build 7 on-device diagnostics (iPad):
+//   30 s ring; underruns=6/5229 (0.11%); reprimes=3; droppedBytes=0 (ring did NOT
+//   overflow). BY EAR: only the LONGEST reply broke up (later in it); shorter
+//   replies clean.
 //
-// The lock-free ring (Build 6) removed priority inversion and fixed the bulk of
-// the chop — near-zero underruns prove the buffer no longer starves. But "starts
-// great, stumbles mid/late" with a healthy buffer is the signature of OVERFLOW,
-// not underflow: the ring is empty at turn start (smooth), but ElevenLabs feeds
-// FASTER than realtime, so by mid-turn the 15 s ring hits its ceiling and the
-// drop-newest overflow discards Joe's later audio → gaps mid and late. The start
-// is always clean because the ring hasn't filled yet.
+// droppedBytes=0 DISPROVED overflow (the ring held the long turn, dropped nothing).
+// underruns ~0 disproves starvation. So on a long turn the buffer is perfect yet
+// the audio breaks late — a cause invisible to every existing counter. Two
+// candidates remain: (1) our copy loops were BYTE-BY-BYTE; the render-callback read
+// runs on the real-time thread every ~23 ms, and a per-byte Swift loop could exceed
+// that deadline deep in a long turn → chop; (2) the long-turn break-up is UPSTREAM
+// (ElevenLabs/WebSocket delivering the tail in a stutter), which our numbers can't
+// see.
 //
-// FIX (this build): (1) enlarge the ring to hold the LONGEST turn — 30 s (960000 B)
-// — so it no longer fills mid-turn; (2) add a droppedBytes counter to the
-// diagnostic so the next test PROVES whether overflow still occurs (droppedBytes=0
-// → solved; > 0 → ring still too small, raise further). Everything else (lock-free
-// SPSC ring, VPIO 16k resample, priming, capture) is UNCHANGED.
+// THIS BUILD does the low-risk likely-fix AND instruments to decide between the two:
+//   (1) Replace all three byte-by-byte ring copies with memcpy (two-segment for the
+//       circular wrap). memcpy on/near the audio thread is correct practice and
+//       removes the per-byte deadline risk.
+//   (2) Add maxRenderUs = the longest single render callback this session, in µs.
+//       Deadline is ~23000 µs. After a long-reply test: if maxRenderUs is small
+//       (say < a few thousand) AND it still broke up → the callback is fine, the
+//       problem is UPSTREAM (look at the socket/feed). If maxRenderUs approached
+//       23000 → the copy was the cause and memcpy should now fix it.
+//
+// Everything else (lock-free SPSC ring, 30 s size, VPIO 16k resample, priming,
+// capture) is UNCHANGED.
 // ───────────────────────────────────────────────────────────────────────────
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
@@ -169,11 +178,18 @@ private final class ByteRingBuffer {
     }
     let toCopy = min(n, free)
     if toCopy < n { droppedBytesPtr.pointee += (n - toCopy) } // partial drop
-    var wi = w % capacity
-    for i in 0..<toCopy {
-      storage[wi] = src[i]
-      wi += 1
-      if wi == capacity { wi = 0 }
+    let wi = w % capacity
+    // Build 8: bulk memcpy instead of byte-by-byte. Circular buffer may wrap, so
+    // copy in up to two contiguous segments. memcpy on the audio-adjacent path is
+    // far faster than a Swift per-byte loop — the loop could blow the render
+    // deadline deep in a long turn.
+    let firstLen = min(toCopy, capacity - wi)
+    storage.withUnsafeMutableBytes { dstRaw in
+      let dst = dstRaw.baseAddress!
+      memcpy(dst.advanced(by: wi), src, firstLen)
+      if toCopy > firstLen {
+        memcpy(dst, src.advanced(by: firstLen), toCopy - firstLen)
+      }
     }
     _store(writeIndex, w + toCopy)      // release: publish data, then new index
   }
@@ -185,11 +201,19 @@ private final class ByteRingBuffer {
     let available = min(count, w - r)
     if available <= 0 { return 0 }
     let d = dest.assumingMemoryBound(to: UInt8.self)
-    var ri = r % capacity
-    for i in 0..<available {
-      d[i] = storage[ri]
-      ri += 1
-      if ri == capacity { ri = 0 }
+    let ri = r % capacity
+    // Build 8: bulk memcpy, up to two segments for the circular wrap. This runs on
+    // the REAL-TIME audio thread every render callback — a per-byte loop here was
+    // the suspected cause of chop late in long turns (loop time growing with the
+    // copy size until it exceeded the ~23 ms deadline). memcpy is O(n) but orders
+    // of magnitude faster in constant terms.
+    let firstLen = min(available, capacity - ri)
+    storage.withUnsafeBytes { srcRaw in
+      let base = srcRaw.baseAddress!
+      memcpy(d, base.advanced(by: ri), firstLen)
+      if available > firstLen {
+        memcpy(d.advanced(by: firstLen), base, available - firstLen)
+      }
     }
     _store(readIndex, r + available)    // release: publish consumption
     return available
@@ -203,12 +227,15 @@ private final class ByteRingBuffer {
     guard (w - r) >= n else { return nil }
     var out = Data(count: n)
     out.withUnsafeMutableBytes { raw in
-      let d = raw.bindMemory(to: UInt8.self)
-      var ri = r % capacity
-      for i in 0..<n {
-        d[i] = storage[ri]
-        ri += 1
-        if ri == capacity { ri = 0 }
+      let d = raw.bindMemory(to: UInt8.self).baseAddress!
+      let ri = r % capacity
+      let firstLen = min(n, capacity - ri)
+      storage.withUnsafeBytes { srcRaw in
+        let base = srcRaw.baseAddress!
+        memcpy(d, base.advanced(by: ri), firstLen)
+        if n > firstLen {
+          memcpy(d.advanced(by: firstLen), base, n - firstLen)
+        }
       }
     }
     _store(readIndex, r + n)
@@ -278,6 +305,16 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   fileprivate var lastRenderBytesRequested: Int = 0
   fileprivate var lastInputFrames: Int = 0
 
+  // Build 8: max time a single render callback took, in microseconds. If a
+  // per-byte copy (now memcpy) or anything else made the callback exceed the
+  // ~23 ms (23000 µs) hardware deadline late in a long turn, we'd see this spike.
+  // maxRenderMicros near the deadline = the callback is the chop; staying tiny =
+  // the callback is fine and the long-turn break-up is UPSTREAM (socket/feed).
+  // mach_absolute_time is cheap and real-time safe; converted to µs via timebase.
+  fileprivate var maxRenderMicros: Int = 0
+  fileprivate var machTimebaseNumer: UInt32 = 0
+  fileprivate var machTimebaseDenom: UInt32 = 0
+
   // Build 3 (Layer 7): playback priming state. `primed` gates the render
   // callback — while false, it emits silence (NOT counted as underrun) until
   // the ring accumulates `primeThresholdBytes`. `reprimeEvents` counts how many
@@ -334,7 +371,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       let live = "renderCalls=\(renderCalls); underruns=\(underrunEvents); "
         + "lastReqBytes=\(lastRenderBytesRequested); lastInputFrames=\(lastInputFrames); "
         + "primed=\(primed); reprimes=\(reprimeEvents); primeThresh=\(primeThresholdBytes)B; "
-        + "droppedBytes=\(playback.droppedBytes)"
+        + "droppedBytes=\(playback.droppedBytes); maxRenderUs=\(maxRenderMicros)"
       result(lastDiagnostics + live)
 
     case "feedPlayback":
@@ -500,6 +537,13 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     underrunEvents = 0
     lastRenderBytesRequested = 0
     lastInputFrames = 0
+    // Build 8: reset render-time max and read the mach timebase once (used to
+    // convert render-callback ticks → microseconds on the audio thread).
+    maxRenderMicros = 0
+    var tb = mach_timebase_info_data_t()
+    mach_timebase_info(&tb)
+    machTimebaseNumer = tb.numer
+    machTimebaseDenom = tb.denom
 
     try checkStatus("AudioUnitInitialize", AudioUnitInitialize(unit))
 
@@ -616,6 +660,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   private static let renderCallback: AURenderCallback = {
     (inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData) -> OSStatus in
     let plugin = Unmanaged<SixPagesVoicePlugin>.fromOpaque(inRefCon).takeUnretainedValue()
+    let renderStart = mach_absolute_time()  // Build 8: time this callback
     guard let abl = ioData else {
       ioActionFlags.pointee.insert(.unitRenderAction_OutputIsSilence)
       return noErr
@@ -636,6 +681,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
           }
         }
         ioActionFlags.pointee.insert(.unitRenderAction_OutputIsSilence)
+        plugin.recordRenderTime(since: renderStart) // Build 8
         return noErr
       }
     }
@@ -657,7 +703,20 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         }
       }
     }
+    plugin.recordRenderTime(since: renderStart) // Build 8
     return noErr
+  }
+
+  // Build 8: convert elapsed mach ticks → microseconds and keep the session max.
+  // Runs on the audio thread; timebase is read once at start. Cheap arithmetic
+  // only — no allocation, no locks.
+  @inline(__always)
+  fileprivate func recordRenderTime(since start: UInt64) {
+    let elapsedTicks = mach_absolute_time() - start
+    if machTimebaseDenom == 0 { return }
+    let micros = Int((elapsedTicks * UInt64(machTimebaseNumer))
+                     / (UInt64(machTimebaseDenom) * 1000))
+    if micros > maxRenderMicros { maxRenderMicros = micros }
   }
 
   // MARK: - Input callback (mic, audio thread) — Layer 3
