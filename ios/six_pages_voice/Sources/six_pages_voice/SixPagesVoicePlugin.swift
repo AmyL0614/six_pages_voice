@@ -7,42 +7,38 @@ import os.log
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 9 (BUILD 5): DEEPER PRIMING CUSHION + RE-PRIME HYSTERESIS.
+// STEP B, LAYER 9 (BUILD 5): FULL-TURN PLAYBACK RING (fixes overlap/override).
 //
-// CONFIRMED by Build 4 on-device (iPad) + Dart byte-alignment fix:
+// CONFIRMED by Build 4 on-device diagnostics (iPad):
 //   granted=48000Hz; playbackPath=VPIO-internal-resample(16k→48000Hz);
-//   output-bus client=16000Hz/1ch; renderCalls=647; underruns=4;
-//   primed=false; reprimes=2; primeThresh=3200B
-//   BY EAR: normal pitch (resample correct), words intelligible, but phrases
-//   OVERLAP / crammed and the FRONT of phrases is clipped.
+//   output-bus client=16000Hz/1ch; renderCalls=2999; underruns=36 (1.2% — buffer
+//   is HEALTHY, not starving); reprimes=4 (rare); primeThresh=11200B.
+//   BY EAR: normal pitch, words intelligible, but sentences PILE ON TOP OF EACH
+//   OTHER — each new piece overrides what Joe was still saying.
 //
-// Diagnosis (symptom-led, ear is the instrument): normal pitch rules out any
-// rate/resample fault — Build 4's architecture is right. Intelligible-but-
-// crammed + front-clipping is a TIMING problem: the 100 ms cushion (3200 B at
-// 16 kHz) is too SHALLOW to bridge the gaps between ElevenLabs' network bursts.
-// The ring drains empty between bursts → re-prime (reprimes=2) → the re-prime
-// silence clips the front of the next phrase; then a burst lands and the render
-// callback races the backlog → phrases overlap/cram.
+// The verdict that forced this build: underruns low + reprimes rare = the ring is
+// NOT starving and priming is NOT thrashing. Yet playback overlaps. Low underruns
+// with overlap is the signature of the OPPOSITE failure: OVERFLOW, not underflow.
 //
-// FIX (this build):
-//   1. DEEPER cushion: ~350 ms (5600 B at 16 kHz) so the ring rides across the
-//      gaps between bursts and does not drain empty in normal streaming. Costs
-//      ~250 ms extra latency before Joe's first word — an easy trade for smooth
-//      playback in a companion voice.
-//   2. RE-PRIME HYSTERESIS: once primed, do NOT un-prime on a single empty read.
-//      Only re-prime after the ring stays fully empty for several CONSECUTIVE
-//      render callbacks (emptyRunToReprime). A momentary dip no longer triggers
-//      a silence gap, so word-fronts stop getting clipped.
-//   3. Diagnostics extended with emptyRun so we can see dips that DIDN'T trip a
-//      re-prime — proof the hysteresis is absorbing jitter instead of clipping.
+// Root cause (certain): ElevenLabs synthesizes Joe's whole turn in a few seconds
+// and streams it to us FASTER THAN REALTIME. The render callback drains at natural
+// speech rate (~1.5 s of audio per 1.5 s). The old ring held only 1.5 s. So within
+// the first seconds of every turn, feed outran drain, the ring filled, and its
+// drop-OLDEST overflow policy (ByteRingBuffer.write drops oldest to make room for
+// newest) OVERWROTE audio Joe had not spoken yet. Later words replaced earlier
+// words mid-playback → "sentences piling on top of each other." This was underneath
+// all prior fixes (rate, priming, converter, byte-alignment) and only became
+// audible once those grosser problems were cleared.
 //
-// If deeper cushion + hysteresis still leaves cramming, the next suspect is FEED
-// GRANULARITY (each ElevenLabs chunk is fed as one lump; time-slicing the feed
-// into steady small writes would smooth burst delivery) — a Dart-side change,
-// tried only if this build doesn't settle it.
+// FIX (this build): size the playback ring to hold a WHOLE TURN (15 s = 480000 B,
+// ~469 KB). Feed can no longer overwrite un-played audio for a single turn; the
+// callback drains it smoothly start to finish. This is the minimal correct fix —
+// true backpressure (blocking the writer) isn't feasible across the fire-and-
+// forget method channel, and a full-turn ring achieves the same practical result.
 //
-// CONVERTER stays deleted (Build 4). CAPTURE untouched. Output bus stays 16 kHz;
-// VPIO resamples internally. We change ONLY the playback cushion + reprime logic.
+// Everything else (Build 4 VPIO-internal resample at 16k, Build 3 priming gate,
+// diagnostics) is UNCHANGED. Only the ring capacity grows. primeThreshold is a
+// min() against half the ring, so it stays 3200 B — unaffected.
 // ───────────────────────────────────────────────────────────────────────────
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
@@ -166,10 +162,18 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // Frame contract (mirrors Android): 640 bytes = 20 ms of 16 kHz mono PCM16.
   private static let frameBytes = 640
 
-  // Playback ring: ~500 ms headroom. Sized for the WORST case (48 kHz mono
-  // PCM16 = 48000 B/s → 24000 B for 500 ms). Build 2 feeds upsampled audio, so
-  // the ring must hold hwRate-rate bytes, not 16 kHz bytes. Oversized-but-safe.
-  private static let playbackBufferBytes = 48000
+  // Playback ring: Build 5 — sized to hold a WHOLE TURN of Joe's audio, not a
+  // small jitter cushion. ElevenLabs synthesizes a full turn in a few seconds
+  // and streams it to us FASTER than realtime, while the render callback drains
+  // at natural speech rate. With the old 1.5s ring, feed outran drain within the
+  // first couple seconds of every turn and the drop-OLDEST overflow policy
+  // (see ByteRingBuffer.write) overwrote un-played audio → later words stomped on
+  // earlier words → "sentences piling on top of each other." Holding a full turn
+  // means feed never overwrites un-played audio; the callback drains it smoothly
+  // start to finish. 15 s of 16 kHz mono PCM16 = 16000 * 2 * 15 = 480000 B
+  // (~469 KB — trivial). Reflections don't run 15 s in one unbroken burst; raise
+  // if a very long single-burst turn ever overflows again.
+  private static let playbackBufferBytes = 480000
   private let playback = ByteRingBuffer(capacityBytes: playbackBufferBytes)
 
   // Capture ring: ~500 ms of clean mic audio waiting to drain up to Dart.
@@ -206,16 +210,8 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // times a mid-stream full-drain forced a re-prime (network stalls). These are
   // read by getDiagnostics so the next device test proves the cushion filled.
   fileprivate var primed = false
-  fileprivate var primeThresholdBytes = 0   // set in startUnit from hwRate (~350 ms)
+  fileprivate var primeThresholdBytes = 0   // set in startUnit from hwRate (~100 ms)
   fileprivate var reprimeEvents = 0
-
-  // Build 5 (Layer 9): re-prime hysteresis. A single empty read no longer un-
-  // primes (that thrash was clipping word-fronts). We only re-prime after the
-  // ring is fully empty for `emptyRunToReprime` CONSECUTIVE render callbacks.
-  // `emptyRun` tracks the current consecutive-empty streak; it resets to 0 the
-  // moment any bytes are provided. Reported in diagnostics to show absorbed dips.
-  fileprivate var emptyRun = 0
-  fileprivate static let emptyRunToReprime = 8   // ~8 callbacks of pure silence
 
   // Build 4: actual hardware sample rate read at start (e.g. 48000), kept ONLY
   // for the diagnostic string. Playback no longer converts to it — the output
@@ -263,7 +259,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // prove the cushion filled and underruns collapsed toward 0.
       let live = "renderCalls=\(renderCalls); underruns=\(underrunEvents); "
         + "lastReqBytes=\(lastRenderBytesRequested); lastInputFrames=\(lastInputFrames); "
-        + "primed=\(primed); reprimes=\(reprimeEvents); emptyRun=\(emptyRun); primeThresh=\(primeThresholdBytes)B"
+        + "primed=\(primed); reprimes=\(reprimeEvents); primeThresh=\(primeThresholdBytes)B"
       result(lastDiagnostics + live)
 
     case "feedPlayback":
@@ -333,18 +329,15 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     hwRate = grantedRate
     lastDiagnostics += "playbackPath=VPIO-internal-resample(16k→\(Int(hwRate))Hz); "
 
-    // ── Build 5: DEEPER priming cushion (~350 ms) to bridge ElevenLabs burst
-    // gaps. Playback is 16 kHz on our side (unit resamples downstream), so
-    // 350 ms of 16 kHz mono PCM16 = 16000 * 2 * 0.35 = 11200 B. Capped to half
-    // the ring so we can never demand more than the ring can hold.
-    let cushionMs = Int(SixPagesVoicePlugin.targetSampleRate * 2.0 * 0.35)
-    primeThresholdBytes = min(cushionMs, SixPagesVoicePlugin.playbackBufferBytes / 2)
+    // ── Build 3: compute the priming cushion (~100 ms). Playback is now 16 kHz
+    // (the render callback consumes 16 kHz bytes; the unit resamples downstream),
+    // so the cushion is 100 ms of 16 kHz mono PCM16 = 16000 * 2 * 0.1 = 3200 B.
+    let hundredMs = Int(SixPagesVoicePlugin.targetSampleRate * 2.0 * 0.1)
+    primeThresholdBytes = min(hundredMs, SixPagesVoicePlugin.playbackBufferBytes / 2)
     primed = false
     reprimeEvents = 0
-    emptyRun = 0
-    os_log("Build5: primeThresholdBytes = %d (≈350 ms at 16 kHz), emptyRunToReprime = %d",
-           log: SixPagesVoicePlugin.log, type: .info,
-           primeThresholdBytes, SixPagesVoicePlugin.emptyRunToReprime)
+    os_log("Build3: primeThresholdBytes = %d (≈100 ms at %{public}.0f Hz)",
+           log: SixPagesVoicePlugin.log, type: .info, primeThresholdBytes, hwRate)
 
     var desc = AudioComponentDescription(
       componentType: kAudioUnitType_Output,
@@ -465,7 +458,6 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     capture.clear()
     // Build 3: reset priming state so a fresh session re-primes cleanly.
     primed = false
-    emptyRun = 0
     if let scratch = captureScratch {
       scratch.deallocate()
       captureScratch = nil
@@ -562,7 +554,6 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     if !plugin.primed {
       if plugin.playback.count >= plugin.primeThresholdBytes {
         plugin.primed = true   // cushion built; fall through to normal read
-        plugin.emptyRun = 0
       } else {
         for buffer in buffers {
           if let mData = buffer.mData {
@@ -582,21 +573,13 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       if provided < bytesRequested {
         plugin.underrunEvents &+= 1
         memset(mData.advanced(by: provided), 0, bytesRequested - provided)
-      }
-      // Build 5: re-prime HYSTERESIS. A single empty/short read no longer un-
-      // primes (that thrash clipped word-fronts). Track a consecutive-empty
-      // streak; only when the ring is FULLY empty for `emptyRunToReprime`
-      // callbacks in a row do we treat it as a real stall and re-prime. Any
-      // bytes provided reset the streak, so normal jitter is absorbed silently.
-      if provided == 0 && bytesRequested > 0 {
-        plugin.emptyRun &+= 1
-        if plugin.emptyRun >= SixPagesVoicePlugin.emptyRunToReprime {
+        // Build 3: a FULL drain (nothing at all provided) on a nonzero request
+        // means the ring emptied mid-stream — a network stall. Re-prime so the
+        // gap re-buffers rather than chopping through the burst gap.
+        if provided == 0 && bytesRequested > 0 {
           plugin.primed = false
           plugin.reprimeEvents &+= 1
-          plugin.emptyRun = 0
         }
-      } else {
-        plugin.emptyRun = 0
       }
     }
     return noErr
