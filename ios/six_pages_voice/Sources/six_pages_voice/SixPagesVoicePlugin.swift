@@ -259,6 +259,9 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   private var ioUnit: AudioUnit?
   private var isRunning = false
 
+  /// Live only for the duration of a session; removed in stopUnit().
+  private var routeObserver: NSObjectProtocol?
+
   private static let targetSampleRate: Double = 16000.0
 
   // Frame contract (mirrors Android): 640 bytes = 20 ms of 16 kHz mono PCM16.
@@ -399,18 +402,147 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     case noComponent
   }
 
+  // MARK: - Audio route (speaker / Bluetooth / wired), mid-session aware
+  //
+  // iOS twin of Android's AudioDeviceCallback. iOS re-evaluates the route itself
+  // when hardware comes and goes; what it does NOT do is tell us about it. Without
+  // this we are flying blind — exactly the position we were in on Android when the
+  // route silently reverted to the earpiece and nothing in the log said so.
+  //
+  // Note the asymmetry with Android, and it is deliberate: on iOS we do NOT re-assert
+  // a device by hand. AVAudioSession owns route arbitration, and fighting it causes
+  // audio glitches. The category options above already encode the priority we want;
+  // this listener exists to OBSERVE the outcome and to catch the case where a route
+  // change needs the speaker re-defaulted.
+
+  private func registerRouteListener() {
+    guard routeObserver == nil else { return }
+    routeObserver = NotificationCenter.default.addObserver(
+      forName: AVAudioSession.routeChangeNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] notification in
+      self?.handleRouteChange(notification)
+    }
+  }
+
+  private func unregisterRouteListener() {
+    if let observer = routeObserver {
+      NotificationCenter.default.removeObserver(observer)
+      routeObserver = nil
+    }
+  }
+
+  private func handleRouteChange(_ notification: Notification) {
+    guard let info = notification.userInfo,
+          let reasonRaw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
+          let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw)
+    else { return }
+
+    switch reason {
+    case .newDeviceAvailable:
+      // Headphones went in mid-conversation. iOS moves to them on its own; log it.
+      logCurrentRoute(prefix: "Route change (device connected)")
+
+    case .oldDeviceUnavailable:
+      // Headphones came out mid-conversation. iOS falls back — but on .playAndRecord
+      // that fallback can land on the EARPIECE. Re-default to the speaker so pulling
+      // out AirPods puts the conversation on the speaker, matching Android.
+      try? AVAudioSession.sharedInstance()
+        .overrideOutputAudioPort(currentRouteIsHeadset() ? .none : .speaker)
+      logCurrentRoute(prefix: "Route change (device removed)")
+
+    case .categoryChange, .override, .routeConfigurationChange:
+      logCurrentRoute(prefix: "Route change")
+
+    default:
+      break
+    }
+  }
+
+  /// True if the CURRENT output is a headset the user chose (BT or wired) rather
+  /// than the phone itself. Used to avoid forcing the speaker over a live headset.
+  private func currentRouteIsHeadset() -> Bool {
+    let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+    for output in outputs {
+      switch output.portType {
+      case .bluetoothA2DP, .bluetoothHFP, .bluetoothLE,
+           .headphones, .headsetMic, .usbAudio, .carAudio:
+        return true
+      default:
+        continue
+      }
+    }
+    return false
+  }
+
+  private func logCurrentRoute(prefix: String = "Route") {
+    let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+    let name = outputs.first.map { routeName($0.portType) } ?? "none"
+    os_log("%{public}@ -> %{public}@", log: SixPagesVoicePlugin.log, type: .info, prefix, name)
+  }
+
+  /// Names match Android's routeName() so both platforms read identically in logs.
+  private func routeName(_ port: AVAudioSession.Port) -> String {
+    switch port {
+    case .bluetoothA2DP, .bluetoothHFP: return "bluetooth"
+    case .bluetoothLE:                  return "bluetooth-le"
+    case .headphones, .headsetMic:      return "wired-headphones"
+    case .usbAudio:                     return "usb-headset"
+    case .carAudio:                     return "car-audio"
+    case .builtInSpeaker:               return "speaker"
+    case .builtInReceiver:              return "earpiece"
+    default:                            return port.rawValue
+    }
+  }
+
   private func startUnit() throws {
     if isRunning { return }
 
     let session = AVAudioSession.sharedInstance()
     do {
-      try session.setCategory(.playAndRecord, mode: .voiceChat,
-                              options: [.defaultToSpeaker, .allowBluetooth])
+      // Route options, mirroring Android's priority behaviour:
+      //
+      //   .defaultToSpeaker  — when NOTHING is attached, use the SPEAKER, not the
+      //                        earpiece. (Without this, .playAndRecord defaults to the
+      //                        receiver/earpiece — the same bug just fixed on Android.)
+      //
+      //   HFP (hands-free)   — MANDATORY for a conversation. It is the BIDIRECTIONAL
+      //                        profile: mic + speaker on the headset. Apple gives HFP
+      //                        ports higher routing priority than A2DP on a device that
+      //                        supports both, and — critically — a headset paired AFTER
+      //                        the session goes active is only picked up reliably when
+      //                        HFP is enabled. A2DP-only misses the mid-session case
+      //                        entirely (no route, no notification). That IS our test.
+      //                        Spelled .allowBluetooth below iOS 26, .allowBluetoothHFP
+      //                        from iOS 26 (the old name was deprecated, not removed).
+      //
+      //   .allowBluetoothA2DP — additive, for output. Modern AirPods/BLE headsets
+      //                        advertise A2DP; without it they may not be offered as an
+      //                        output route. Apple explicitly permits HFP + A2DP together.
+      //
+      // A headset the user CHOSE always outranks the built-in speaker. iOS honours that
+      // once the options permit the route: .defaultToSpeaker is the FALLBACK for the
+      // no-headset case, never an override. Same contract as Android.
+      var options: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothA2DP]
+      if #available(iOS 26.0, *) {
+        options.insert(.allowBluetoothHFP)
+      } else {
+        options.insert(.allowBluetooth)   // same bit; renamed in iOS 26
+      }
+
+      try session.setCategory(.playAndRecord, mode: .voiceChat, options: options)
       try session.setPreferredSampleRate(SixPagesVoicePlugin.targetSampleRate)
       try session.setActive(true)
     } catch {
       throw AudioError.session(error.localizedDescription)
     }
+
+    // Follow the audio if a headset is connected or removed MID-CONVERSATION, and
+    // log where it went. Android does this via AudioDeviceCallback; this is the
+    // iOS twin, so the two platforms behave — and LOG — identically.
+    registerRouteListener()
+    logCurrentRoute()
 
     // ── Layer 4 instrumentation: what rate did the hardware ACTUALLY grant? ───
     // This is the risk-1 verdict. If actualRate == 16000, our clean path is
@@ -582,6 +714,9 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       captureScratch = nil
       captureScratchFrameCap = 0
     }
+    // Drop the route listener BEFORE deactivating the session, so a deactivation-
+    // triggered route change cannot call back into a half-torn-down engine.
+    unregisterRouteListener()
     try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
   }
 
