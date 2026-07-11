@@ -273,15 +273,28 @@ class SixPagesVoicePlugin :
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val available = am.availableCommunicationDevices
-            val chosen = routePreference.firstNotNullOfOrNull { wanted ->
-                available.firstOrNull { it.type == wanted }
+
+            // Explicit loop, explicitly typed. Walk the preference order and take
+            // the first device that is actually available.
+            var chosen: AudioDeviceInfo? = null
+            for (wanted in routePreference) {
+                for (device in available) {
+                    if (device.type == wanted) {
+                        chosen = device
+                        break
+                    }
+                }
+                if (chosen != null) break
             }
+
             if (chosen != null) {
                 // No-op if it is already the active route — avoids audio glitches
                 // from redundant re-selection on every device callback.
                 if (am.communicationDevice?.id != chosen.id) {
                     val ok = am.setCommunicationDevice(chosen)
                     Log.i(tag, "Route -> ${routeName(chosen.type)} (ok=$ok)")
+                } else {
+                    Log.i(tag, "Route unchanged (${routeName(chosen.type)})")
                 }
             } else {
                 @Suppress("DEPRECATION")
