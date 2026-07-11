@@ -1,3 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
   package="com.sixpages.six_pages_voice">
+
+  <!-- Keeps the CPU alive while the SCREEN sleeps. Partial wakelock only. -->
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+  <!-- Foreground service, and its microphone type. On Android 14+ the typed
+       permission is REQUIRED or the mic is silently muted once backgrounded. -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+  <application>
+    <service
+      android:name=".VoiceSessionService"
+      android:foregroundServiceType="microphone"
+      android:exported="false" />
+  </application>
+
 </manifest>

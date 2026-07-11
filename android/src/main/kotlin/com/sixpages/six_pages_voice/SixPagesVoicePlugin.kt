@@ -200,16 +200,23 @@ class SixPagesVoicePlugin :
     // --- Engine ---
 
     private fun startEngine(): Boolean {
+        // Foreground service FIRST. It must be running before capture begins, or
+        // Android 14+ will mute the mic the moment the app backgrounds. It also
+        // holds the partial wakelock that keeps the CPU alive with the screen off.
+        appContext?.let { VoiceSessionService.start(it) }
+
         routeToSpeaker()
         val playbackOk = startPlayback()
         if (!playbackOk) {
             clearSpeakerRoute()
+            appContext?.let { VoiceSessionService.stop(it) }
             return false
         }
         val captureOk = startCapture()
         if (!captureOk) {
             stopPlayback()
             clearSpeakerRoute()
+            appContext?.let { VoiceSessionService.stop(it) }
             return false
         }
 
@@ -225,6 +232,8 @@ class SixPagesVoicePlugin :
         stopCapture()
         stopPlayback()
         clearSpeakerRoute()
+        // Last: tears down the notification and releases the wakelock.
+        appContext?.let { VoiceSessionService.stop(it) }
     }
 
     // --- Speaker routing ---
