@@ -404,16 +404,35 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
   // MARK: - Audio route (speaker / Bluetooth / wired), mid-session aware
   //
-  // iOS twin of Android's AudioDeviceCallback. iOS re-evaluates the route itself
-  // when hardware comes and goes; what it does NOT do is tell us about it. Without
-  // this we are flying blind — exactly the position we were in on Android when the
-  // route silently reverted to the earpiece and nothing in the log said so.
+  // OBSERVE-ONLY. This listener reports where audio went. It does NOT steer.
   //
-  // Note the asymmetry with Android, and it is deliberate: on iOS we do NOT re-assert
-  // a device by hand. AVAudioSession owns route arbitration, and fighting it causes
-  // audio glitches. The category options above already encode the priority we want;
-  // this listener exists to OBSERVE the outcome and to catch the case where a route
-  // change needs the speaker re-defaulted.
+  // That is a deliberate correction of an earlier version that called
+  // overrideOutputAudioPort(.speaker) on device removal, and it is the reason long
+  // replies chopped and car connections dropped after a moment. Three points from
+  // Apple's own documentation, each sufficient on its own:
+  //
+  //   1. "Apps should treat these changes as authoritative. They should NEVER
+  //      immediately attempt to revert the change." Overriding the port mid-stream
+  //      is exactly that.
+  //
+  //   2. The notification is POSTED ON A SECONDARY THREAD. Acting on it means
+  //      touching session state at an unpredictable moment relative to the running
+  //      audio unit.
+  //
+  //   3. Most decisive: with kAudioUnitSubType_VoiceProcessingIO, "the system will
+  //      automatically manage this for the application. In particular, ports of type
+  //      AVAudioSessionPortBluetoothHFP and AVAudioSessionPortCarAudio." VPIO ALREADY
+  //      handles Bluetooth and car routing. There is nothing for us to fix, and
+  //      intervening breaks what was working.
+  //
+  // The category options set at session start already encode the priority we want
+  // (headset the user chose > built-in speaker). iOS honours it. Our job is to watch,
+  // log, and stay out of the way.
+  //
+  // NOTE the asymmetry with Android, which is correct and intended: Android's
+  // AudioManager DOES expect the app to select the device, and there we re-assert
+  // deliberately. iOS does not. The platforms have different contracts; matching the
+  // Android pattern here is what caused the bug.
 
   private func registerRouteListener() {
     guard routeObserver == nil else { return }
@@ -433,6 +452,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     }
   }
 
+  /// Logs the new route. Deliberately takes NO corrective action — see above.
   private func handleRouteChange(_ notification: Notification) {
     guard let info = notification.userInfo,
           let reasonRaw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
@@ -441,15 +461,12 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
     switch reason {
     case .newDeviceAvailable:
-      // Headphones went in mid-conversation. iOS moves to them on its own; log it.
+      // Headphones/car connected mid-conversation. VPIO moves to them itself.
       logCurrentRoute(prefix: "Route change (device connected)")
 
     case .oldDeviceUnavailable:
-      // Headphones came out mid-conversation. iOS falls back — but on .playAndRecord
-      // that fallback can land on the EARPIECE. Re-default to the speaker so pulling
-      // out AirPods puts the conversation on the speaker, matching Android.
-      try? AVAudioSession.sharedInstance()
-        .overrideOutputAudioPort(currentRouteIsHeadset() ? .none : .speaker)
+      // Headphones/car removed mid-conversation. VPIO falls back itself.
+      // We do NOT override the port here. That override was the bug.
       logCurrentRoute(prefix: "Route change (device removed)")
 
     case .categoryChange, .override, .routeConfigurationChange:
@@ -458,22 +475,6 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     default:
       break
     }
-  }
-
-  /// True if the CURRENT output is a headset the user chose (BT or wired) rather
-  /// than the phone itself. Used to avoid forcing the speaker over a live headset.
-  private func currentRouteIsHeadset() -> Bool {
-    let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
-    for output in outputs {
-      switch output.portType {
-      case .bluetoothA2DP, .bluetoothHFP, .bluetoothLE,
-           .headphones, .headsetMic, .usbAudio, .carAudio:
-        return true
-      default:
-        continue
-      }
-    }
-    return false
   }
 
   private func logCurrentRoute(prefix: String = "Route") {
