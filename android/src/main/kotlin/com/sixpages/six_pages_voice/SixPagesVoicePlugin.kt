@@ -2,6 +2,7 @@ package com.sixpages.six_pages_voice
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -87,6 +88,9 @@ class SixPagesVoicePlugin :
     private var audioTrack: AudioTrack? = null
 
     private var savedAudioMode = AudioManager.MODE_NORMAL
+
+    // Live only for the duration of a session; nulled in clearSpeakerRoute().
+    private var routeListener: AudioDeviceCallback? = null
 
     // --- AEC3 render->capture delay, MEASURED (not guessed) --------------
     //
@@ -208,6 +212,12 @@ class SixPagesVoicePlugin :
             clearSpeakerRoute()
             return false
         }
+
+        // RE-ASSERT the route now that BOTH streams are live. Starting an audio
+        // session in MODE_IN_COMMUNICATION can silently clobber the route we set
+        // above and drop us back to the earpiece. Setting it last makes us the
+        // final word, and closes the intermittent "sometimes earpiece" race.
+        selectBestRoute()
         return true
     }
 
@@ -223,29 +233,113 @@ class SixPagesVoicePlugin :
         return appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     }
 
+    // Preference order. A headset the user CHOSE (paired or plugged in) always
+    // wins over the built-in speaker. Speaker is the FALLBACK, not an override:
+    // forcing TYPE_BUILTIN_SPEAKER unconditionally would yank audio away from
+    // someone's AirPods or car and broadcast Joe out loud — the exact opposite
+    // of what a private companion conversation needs.
+    private val routePreference = intArrayOf(
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_BLE_HEADSET,
+        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER  // default when nothing is attached
+    )
+
+    // Enters communication mode ONCE per session and selects the best route.
     private fun routeToSpeaker() {
         val am = audioManager() ?: return
         savedAudioMode = am.mode
         am.mode = AudioManager.MODE_IN_COMMUNICATION
+        selectBestRoute()
+        registerRouteListener()
+    }
+
+    /**
+     * Picks the highest-priority available communication device and selects it.
+     *
+     * Called (a) at session start, (b) AGAIN after the AudioTrack and AudioRecord
+     * are live, and (c) whenever devices are added/removed mid-session.
+     *
+     * The re-assert in (b) is deliberate. setCommunicationDevice() can be silently
+     * clobbered when a new audio session starts in MODE_IN_COMMUNICATION — the
+     * framework re-evaluates and can fall back to the EARPIECE. That race is
+     * boot/state-dependent, which is why routing "worked one session, not the next"
+     * with no code change. Setting the route LAST makes us the final word.
+     */
+    private fun selectBestRoute() {
+        val am = audioManager() ?: return
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val speaker = am.availableCommunicationDevices.firstOrNull {
-                it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            val available = am.availableCommunicationDevices
+            val chosen = routePreference.firstNotNullOfOrNull { wanted ->
+                available.firstOrNull { it.type == wanted }
             }
-            if (speaker != null) {
-                am.setCommunicationDevice(speaker)
+            if (chosen != null) {
+                // No-op if it is already the active route — avoids audio glitches
+                // from redundant re-selection on every device callback.
+                if (am.communicationDevice?.id != chosen.id) {
+                    val ok = am.setCommunicationDevice(chosen)
+                    Log.i(tag, "Route -> ${routeName(chosen.type)} (ok=$ok)")
+                }
             } else {
                 @Suppress("DEPRECATION")
                 am.isSpeakerphoneOn = true
+                Log.i(tag, "Route -> speakerphone (no communication device offered)")
             }
         } else {
+            // Pre-S: no setCommunicationDevice(). A connected headset (BT or wired)
+            // takes the route on its own; speakerphone must be OFF or it overrides.
             @Suppress("DEPRECATION")
-            am.isSpeakerphoneOn = true
+            val headsetAttached = am.isBluetoothScoOn || am.isWiredHeadsetOn
+            @Suppress("DEPRECATION")
+            am.isSpeakerphoneOn = !headsetAttached
+            Log.i(tag, "Route -> ${if (headsetAttached) "headset" else "speakerphone"} (legacy path)")
         }
+    }
+
+    // Follows the audio to a headset connected MID-CONVERSATION. Someone reaching
+    // for headphones while talking to Joe is a "make this private, now" moment;
+    // audio has to follow. Also handles the reverse — unplug and fall back to speaker.
+    private fun registerRouteListener() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        if (routeListener != null) return
+        val am = audioManager() ?: return
+
+        val cb = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+                selectBestRoute()
+            }
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+                selectBestRoute()
+            }
+        }
+        am.registerAudioDeviceCallback(cb, mainHandler)
+        routeListener = cb
+    }
+
+    private fun unregisterRouteListener() {
+        val cb = routeListener ?: return
+        routeListener = null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        audioManager()?.unregisterAudioDeviceCallback(cb)
+    }
+
+    private fun routeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth"
+        AudioDeviceInfo.TYPE_BLE_HEADSET -> "bluetooth-le"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "wired-headset"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired-headphones"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "usb-headset"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "earpiece"
+        else -> "type-$type"
     }
 
     private fun clearSpeakerRoute() {
         val am = audioManager() ?: return
+        unregisterRouteListener()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             am.clearCommunicationDevice()
         } else {
