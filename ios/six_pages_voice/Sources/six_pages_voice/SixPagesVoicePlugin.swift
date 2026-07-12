@@ -622,8 +622,21 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
       // THE LINE THAT WAS MISSING. The old observer took `_` and discarded userInfo,
       // throwing away the reason on every single route change since this file was written.
-      let raw = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 999
-      let reason = self.routeChangeReasonName(raw)
+      //
+      // Read it as NSNumber, which is the DOCUMENTED type in the header:
+      //   "value is an NSNumber representing an AVAudioSessionRouteChangeReason"
+      // `as? UInt` is the common idiom and does work, but NSNumber->uintValue is the
+      // type Apple actually promises. A diagnostic that silently reports the WRONG
+      // reason is worse than none at all: this strip gets read once, in a car, after
+      // a drive. It does not get a second chance. No fallback sentinel, no ambiguity.
+      let reason: String
+      if let num = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? NSNumber {
+        reason = self.routeChangeReasonName(UInt(num.uintValue))
+      } else {
+        // Should be impossible. If this EVER appears on the strip, the notification
+        // shape changed and nothing below it can be trusted.
+        reason = "NO-REASON-KEY"
+      }
 
       let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
       let now = outputs.first.map { self.routeName($0.portType) } ?? "none"
@@ -689,11 +702,18 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   }
 
   private func handleInterruption(_ note: Notification) {
+    // NSNumber is the documented type here too. Same reasoning as the route observer:
+    // interruptions=0 must mean "the car did not interrupt us", NEVER "the cast failed
+    // and we silently returned." That number was used to KILL a theory. It has to be real.
     guard
       let info = note.userInfo,
-      let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
-      let type = AVAudioSession.InterruptionType(rawValue: raw)
-    else { return }
+      let num = info[AVAudioSessionInterruptionTypeKey] as? NSNumber,
+      let type = AVAudioSession.InterruptionType(rawValue: UInt(num.uintValue))
+    else {
+      os_log("Interruption notification with NO TYPE KEY — notification shape changed",
+             log: SixPagesVoicePlugin.log, type: .error)
+      return
+    }
 
     switch type {
     case .began:
@@ -703,8 +723,9 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
     case .ended:
       var shouldResume = false
-      if let optsRaw = info[AVAudioSessionInterruptionOptionKey] as? UInt {
-        shouldResume = AVAudioSession.InterruptionOptions(rawValue: optsRaw).contains(.shouldResume)
+      if let optsNum = info[AVAudioSessionInterruptionOptionKey] as? NSNumber {
+        shouldResume = AVAudioSession.InterruptionOptions(rawValue: UInt(optsNum.uintValue))
+          .contains(.shouldResume)
       }
       os_log("Interruption ENDED (shouldResume=%{public}@)",
              log: SixPagesVoicePlugin.log, type: .info, shouldResume ? "true" : "false")
