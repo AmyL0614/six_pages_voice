@@ -467,10 +467,20 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // lastRenderBytesRequested vs lastInputFrames reveals rate/frame shape.
       // Build 3: append priming state (primed / reprimes / threshold) so we can
       // prove the cushion filled and underruns collapsed toward 0.
+      // Build 12: interruptions + live route. The STRIP IS THE ONLY iOS INSTRUMENT.
+      // os_log is unreadable in this workflow (Windows + TestFlight, no Mac), so a
+      // counter that is not on this line does not exist. The car-drop diagnosis
+      // lives or dies on interruptions= — if the car never interrupts us, the
+      // theory is wrong and we look elsewhere WITH DATA. route= is here because
+      // the very next question after that is "what did iOS actually pick."
+      let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+      let liveRoute = outputs.first.map { routeName($0.portType) } ?? "none"
       let live = "renderCalls=\(renderCalls); underruns=\(underrunEvents); "
         + "lastReqBytes=\(lastRenderBytesRequested); lastInputFrames=\(lastInputFrames); "
         + "primed=\(primed); reprimes=\(reprimeEvents); primeThresh=\(primeThresholdBytes)B; "
-        + "droppedBytes=\(playback.droppedBytes); maxRenderUs=\(maxRenderMicros)"
+        + "droppedBytes=\(playback.droppedBytes); maxRenderUs=\(maxRenderMicros); "
+        + "interruptions=\(interruptionCount); resumeFails=\(interruptionResumeFailures); "
+        + "route=\(liveRoute)"
       result(lastDiagnostics + live)
 
     case "feedPlayback":
