@@ -8,7 +8,49 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
+// BUILD 13: THE ROUTE OBSERVER WAS THROWING AWAY THE ANSWER.
+//
+// MEASURED IN THE CAR (iPad, July 12): interruptions=0; resumeFails=0; route=speaker;
+// renderCalls=758; droppedBytes=0.
+//
+// READ THAT CAREFULLY, IT KILLS TWO THEORIES AT ONCE:
+//
+//   1. THE CAR DOES NOT INTERRUPT US. interruptions=0. Build 12's theory was WRONG.
+//      Keep the interruption handler — Apple requires it and it will matter for phone
+//      calls and Siri — but it is NOT the car mechanism. Do not rebuild that theory.
+//
+//   2. THE SESSION NEVER DIES. renderCalls=758, droppedBytes=0, no teardown. What the
+//      user hears as "the call dropped after 5 seconds" is NOT a drop. It is a ROUTE
+//      CHANGE: iOS moves the output off the car and back to the built-in speaker while
+//      the session keeps happily rendering. route=speaker. The audio is fine. It is
+//      just coming out of the wrong hole.
+//
+// It is also NOT A2DP. The car failed to hold on a build that HAD .allowBluetoothA2DP
+// and on this one that does not. A2DP is not the variable. Do not put it back.
+//
+// SO WHY DOES iOS MOVE THE ROUTE? We have never known — because THIS FILE HAS BEEN
+// DELETING THE ANSWER. The route observer took the notification as `_` and ignored
+// userInfo, which carries AVAudioSessionRouteChangeReasonKey. iOS NAMES THE CAUSE of
+// every route change and we threw it away every single time, then spent nights
+// guessing at what it had already told us plainly.
+//
+// This build captures it: routeAtStart, routeChanges, and why=[reason>destination, ...]
+// go ON THE STRIP — the only iOS instrument that exists in this workflow (Windows,
+// TestFlight, no Mac, no Console.app). A counter that is not on the strip does not exist.
+//
+// The reasons are NOT equivalent and point at completely different fixes:
+//   oldDeviceUnavailable        — the CAR dropped us; the fight is with its HFP link.
+//   noSuitableRouteForCategory  — .playAndRecord cannot live on that route at all.
+//   categoryChange              — WE did it to ourselves.
+//   override                    — someone called overrideOutputAudioPort. Should be NOBODY.
+// Guessing between these has already cost this project multiple nights. Stop guessing.
+//
+// Diagnostic-only. No behavior change. Nothing routes, nothing overrides.
+//
+// ── PRIOR ──────────────────────────────────────────────────────────────────
+//
 // BUILD 12: INTERRUPTION HANDLING. THE CONTRACT WE NEVER IMPLEMENTED.
+// (Correct and kept — but NOT the car bug. interruptions=0 in the car, measured.)
 //
 // Symptom: connect the iPad to a CAR over Bluetooth, the call opens and then DROPS
 // about four seconds later. Android showed the same shape (see its focus commit).
@@ -338,6 +380,15 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   private var interruptionCount = 0
   private var interruptionResumeFailures = 0
 
+  /// Build 13 diagnostics: WHY did iOS move the route?
+  /// The route observer has existed for weeks and has been THROWING THE ANSWER AWAY —
+  /// it ignored the notification's userInfo, which carries AVAudioSessionRouteChangeReasonKey.
+  /// That reason names the cause outright. It is the single most diagnostic fact in the
+  /// car problem and it has never once been readable, because it only ever went to os_log.
+  private var routeChangeCount = 0
+  private var routeAtStart = "?"
+  private var routeHistory: [String] = []   // reason>route, capped; the whole story in one field
+
   private static let targetSampleRate: Double = 16000.0
 
   // Frame contract (mirrors Android): 640 bytes = 20 ms of 16 kHz mono PCM16.
@@ -480,7 +531,8 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         + "primed=\(primed); reprimes=\(reprimeEvents); primeThresh=\(primeThresholdBytes)B; "
         + "droppedBytes=\(playback.droppedBytes); maxRenderUs=\(maxRenderMicros); "
         + "interruptions=\(interruptionCount); resumeFails=\(interruptionResumeFailures); "
-        + "route=\(liveRoute)"
+        + "routeAtStart=\(routeAtStart); route=\(liveRoute); "
+        + "routeChanges=\(routeChangeCount); why=[\(routeHistory.joined(separator: " | "))]"
       result(lastDiagnostics + live)
 
     case "feedPlayback":
@@ -530,14 +582,61 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // iOS does not. Importing the Android mechanism across that boundary was the bug.
   // Symmetry in the LOGS is good. Symmetry in the MECHANISM is not.
 
+  /// Build 13: iOS names the cause of every route change. Decode it.
+  ///
+  ///   oldDeviceUnavailable  — the car/headset WENT AWAY. iOS had no choice.
+  ///   override              — SOMEONE called overrideOutputAudioPort. Should be nobody: we deleted it.
+  ///   categoryChange        — the session category/options were changed mid-flight.
+  ///   routeConfigChange     — the route's configuration changed underneath us.
+  ///   newDeviceAvailable    — something new appeared and iOS preferred it.
+  ///   noSuitableRouteForCategory — .playAndRecord could not be satisfied by the current device.
+  ///
+  /// For the car, these are NOT equivalent and they point at completely different fixes.
+  /// oldDeviceUnavailable means the CAR dropped us and the fight is with the car's HFP link.
+  /// noSuitableRouteForCategory means .playAndRecord cannot live on that route at all.
+  /// categoryChange means WE did it to ourselves. Guessing between these has cost us nights.
+  private func routeChangeReasonName(_ raw: UInt) -> String {
+    guard let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return "unknown(\(raw))" }
+    switch reason {
+    case .unknown:                    return "unknown"
+    case .newDeviceAvailable:         return "newDeviceAvailable"
+    case .oldDeviceUnavailable:       return "oldDeviceUnavailable"
+    case .categoryChange:             return "categoryChange"
+    case .override:                   return "override"
+    case .wakeFromSleep:              return "wakeFromSleep"
+    case .noSuitableRouteForCategory: return "noSuitableRouteForCategory"
+    case .routeConfigurationChange:   return "routeConfigChange"
+    @unknown default:                 return "unhandled(\(raw))"
+    }
+  }
+
   private func registerRouteListener() {
     guard routeObserver == nil else { return }
     routeObserver = NotificationCenter.default.addObserver(
       forName: AVAudioSession.routeChangeNotification,
       object: AVAudioSession.sharedInstance(),
       queue: .main
-    ) { [weak self] _ in
-      self?.logCurrentRoute(prefix: "Route change")
+    ) { [weak self] note in
+      guard let self = self else { return }
+      self.routeChangeCount += 1
+
+      // THE LINE THAT WAS MISSING. The old observer took `_` and discarded userInfo,
+      // throwing away the reason on every single route change since this file was written.
+      let raw = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 999
+      let reason = self.routeChangeReasonName(raw)
+
+      let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+      let now = outputs.first.map { self.routeName($0.portType) } ?? "none"
+
+      // Compact, strip-readable trail: reason>destination, oldest first.
+      // Capped so a long drive cannot push the rest of the strip off screen.
+      if self.routeHistory.count < 6 {
+        self.routeHistory.append("\(reason)>\(now)")
+      }
+
+      os_log("Route change #%d: reason=%{public}@ -> %{public}@",
+             log: SixPagesVoicePlugin.log, type: .info,
+             self.routeChangeCount, reason, now)
     }
   }
 
@@ -689,6 +788,13 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     registerInterruptionListener()
     interruptionCount = 0
     interruptionResumeFailures = 0
+    routeChangeCount = 0
+    routeHistory = []
+    // Where did we BEGIN? route= on the strip is post-hoc and only says where we ENDED.
+    // Without this, "route=speaker" cannot distinguish "never got the car" from
+    // "got the car and lost it" — two different bugs.
+    let startOutputs = session.currentRoute.outputs
+    routeAtStart = startOutputs.first.map { routeName($0.portType) } ?? "none"
     logCurrentRoute(prefix: "Route at start")
 
     // ── Layer 4 instrumentation: what rate did the hardware ACTUALLY grant? ───
