@@ -8,34 +8,80 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 12 (BUILD 8): memcpy COPIES + RENDER-TIME DIAGNOSTIC.
+// STEP B, LAYER 13 (BUILD 9): PROPER JITTER BUFFER (deep cushion + hysteresis).
 //
-// CONFIRMED by Build 7 on-device diagnostics (iPad):
-//   30 s ring; underruns=6/5229 (0.11%); reprimes=3; droppedBytes=0 (ring did NOT
-//   overflow). BY EAR: only the LONGEST reply broke up (later in it); shorter
-//   replies clean.
+// BUILD 8 ANSWERED ITS OWN QUESTION. On-device (iPad), long reply, chop at the tail:
+//   maxRenderUs=25   (deadline is 23000 µs — the callback is idle-fast)
+//   droppedBytes=0   (the ring never overflowed)
+//   underruns=4 / renderCalls=2607  (0.15% — HEALTHY, in line with Build 7's 0.11%)
+//   reprimes=2       ← THE BUG
 //
-// droppedBytes=0 DISPROVED overflow (the ring held the long turn, dropped nothing).
-// underruns ~0 disproves starvation. So on a long turn the buffer is perfect yet
-// the audio breaks late — a cause invisible to every existing counter. Two
-// candidates remain: (1) our copy loops were BYTE-BY-BYTE; the render-callback read
-// runs on the real-time thread every ~23 ms, and a per-byte Swift loop could exceed
-// that deadline deep in a long turn → chop; (2) the long-turn break-up is UPSTREAM
-// (ElevenLabs/WebSocket delivering the tail in a stutter), which our numbers can't
-// see.
+// Build 8's own decision rule: "if maxRenderUs is small AND it still broke up → the
+// callback is fine, the problem is UPSTREAM (socket/feed)." maxRenderUs=25 is the
+// small case. The copy was never the cause; memcpy was right but not the fix.
 //
-// THIS BUILD does the low-risk likely-fix AND instruments to decide between the two:
-//   (1) Replace all three byte-by-byte ring copies with memcpy (two-segment for the
-//       circular wrap). memcpy on/near the audio thread is correct practice and
-//       removes the per-byte deadline risk.
-//   (2) Add maxRenderUs = the longest single render callback this session, in µs.
-//       Deadline is ~23000 µs. After a long-reply test: if maxRenderUs is small
-//       (say < a few thousand) AND it still broke up → the callback is fine, the
-//       problem is UPSTREAM (look at the socket/feed). If maxRenderUs approached
-//       23000 → the copy was the cause and memcpy should now fix it.
+// NOTE what the numbers say and don't say. The underrun RATE is fine — 0.15% is a
+// healthy stream, and the feed is NOT degrading. There is no upstream regression to
+// chase. The chop is not caused by starvation being frequent. It is caused by our
+// RESPONSE to starvation being catastrophic.
 //
-// Everything else (lock-free SPSC ring, 30 s size, VPIO 16k resample, priming,
-// capture) is UNCHANGED.
+// ROOT CAUSE — the re-prime was AMPLIFYING jitter instead of absorbing it.
+// The old render callback did this on a full drain:
+//     if provided == 0 { primed = false; reprimeEvents += 1 }
+// Flipping `primed` to false sends the callback back to the startup gate, which then
+// emits HARD SILENCE until the ring rebuilds the ENTIRE 3200 B cushion. That is a
+// mandatory ~100 ms mute — imposed on top of the original gap, and imposed even if
+// Joe's audio is already flowing again on the very next callback.
+//
+// So ONE late chunk cost 100 ms of silence. reprimes=2 = TWO enforced 100 ms mutes
+// inside a single long reply. THAT is the chop. Long replies hit it because every extra
+// second of Joe talking is another chance to catch one hiccup — and every hiccup was
+// charged the full penalty. Short replies never drained, so they never tripped it.
+//
+// This is why a 0.15% underrun rate was still audible: a rare, NORMAL event was being
+// converted into a 100 ms cut. The stream is healthy. The buffer logic was not.
+//
+// WORKING WITH THE PLATFORM, NOT AGAINST IT:
+//   • ElevenLabs documents that agent audio ARRIVES IN CHUNKS with variable timing, and
+//     explicitly instructs the client to "implement a jitter buffer to smooth out
+//     variations in packet arrival times" and to use "adaptive buffering." Burstiness is
+//     their DESIGN, not a fault. The old code treated normal chunk variance as a fault
+//     condition and responded by muting. That is fighting the contract.
+//   • A jitter buffer ABSORBS a gap. It does not answer a gap by adding more silence.
+//
+// THE FIX — a real jitter buffer, the way a production streaming player does it. It
+// distinguishes the two events the old code conflated:
+//
+//   ONE LATE CHUNK (transient)  → zero-fill ONLY the missing bytes and KEEP PLAYING.
+//     Stay primed. The instant more audio lands, it plays. No added silence, no mute.
+//
+//   A SUSTAINED STALL (real)    → after `drainsBeforeRebuffer` CONSECUTIVE fully-empty
+//     callbacks — not one blip — drop back to buffering and rebuild only a SHALLOW
+//     cushion (rebufferThresholdBytes ≈ 40 ms), NOT the full startup cushion. Machine-
+//     gunning ticks through a genuine network stall is worse than a short rebuffer;
+//     paying the full 100 ms startup cost for a transient is worse than either.
+//
+// The old code was a BROKEN version of this: it rebuffered on a SINGLE drain, and it
+// rebuffered to the FULL startup cushion. Worst of both. Same instinct, wrong numbers.
+//
+//   STARTUP cushion : 400 ms (was 100 ms). The ring is 30 s (960000 B) — there is
+//     enormous headroom, and the classic guard against underrun is simply a deeper
+//     buffer. 400 ms of added latency before Joe's first word is imperceptible in a
+//     reflective conversation, and it lets the ring ride out ordinary jitter without
+//     ever draining. 100 ms was only ~4.35 render calls deep — far too thin to absorb
+//     a network that delivers in bursts.
+//   REBUFFER cushion: 40 ms. Enough to get ahead of the drain again, small enough that
+//     a real stall recovers fast.
+//
+// NOT CHANGED, deliberately: the lock-free SPSC ring (correct), memcpy copies (correct),
+// the 30 s ring size (correct — droppedBytes=0 proves it), VPIO 16k internal resample
+// (correct — 736 B/368 frames = 23.0 ms MATCHES ioBuf=0.0233 s, so the ring units are
+// right), the observe-only route listener from c95f26c (correct, and a different bug),
+// and the ENTIRE Android path (proven; untouched). The Dart method-channel surface is
+// unchanged, so FlutterFlow needs nothing new.
+//
+// Diagnostic counters are KEPT and EXTENDED (maxConsecutiveDrains, rebufferThresh).
+// They are the only reason this was findable, and they are how the next test is read.
 // ───────────────────────────────────────────────────────────────────────────
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
@@ -318,14 +364,56 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   fileprivate var machTimebaseNumer: UInt32 = 0
   fileprivate var machTimebaseDenom: UInt32 = 0
 
-  // Build 3 (Layer 7): playback priming state. `primed` gates the render
-  // callback — while false, it emits silence (NOT counted as underrun) until
-  // the ring accumulates `primeThresholdBytes`. `reprimeEvents` counts how many
-  // times a mid-stream full-drain forced a re-prime (network stalls). These are
-  // read by getDiagnostics so the next device test proves the cushion filled.
+  // Build 9 (Layer 13): JITTER BUFFER STATE.
+  //
+  // `primed` gates the render callback: while false it emits silence (NOT counted as
+  // an underrun — buffering is not starving) until the ring holds enough bytes.
+  //
+  // TWO DIFFERENT CUSHIONS, because startup and mid-stream recovery are different
+  // problems (the old code wrongly used one number for both):
+  //   • primeThresholdBytes    — the STARTUP cushion (~400 ms). Deep, because we get
+  //     to pay this latency exactly once, before Joe's first word, and it buys us the
+  //     headroom to ride out bursty delivery for the rest of the turn.
+  //   • rebufferThresholdBytes — the MID-STREAM cushion (~40 ms). Shallow, because a
+  //     stall already cost the listener silence; making them wait another 400 ms to
+  //     recover would be worse than the stall.
+  //
+  // HYSTERESIS: `consecutiveDrains` counts fully-empty callbacks IN A ROW. A single
+  // empty callback is one late chunk — we zero-fill it and keep playing. Only when
+  // drainsBeforeRebuffer empties land BACK TO BACK do we conclude the stream has
+  // genuinely stalled and drop into rebuffering. This is the whole difference between
+  // absorbing jitter and amplifying it.
   fileprivate var primed = false
-  fileprivate var primeThresholdBytes = 0   // set in startUnit from hwRate (~100 ms)
-  fileprivate var reprimeEvents = 0
+  fileprivate var primeThresholdBytes = 0      // startup cushion  (~400 ms), set in startUnit
+  fileprivate var rebufferThresholdBytes = 0   // mid-stream cushion (~40 ms), set in startUnit
+  fileprivate var reprimeEvents = 0            // times a SUSTAINED stall forced a rebuffer
+
+  /// Fully-empty render callbacks seen back-to-back. Reset to 0 the moment ANY audio
+  /// is provided. Audio-thread only.
+  fileprivate var consecutiveDrains = 0
+
+  /// True once the FIRST real audio byte has been rendered this session. This — not
+  /// consecutiveDrains — is what distinguishes "startup" from "recovery" at the gate.
+  ///
+  /// Using consecutiveDrains for that decision is subtly WRONG: on recovery the gate
+  /// clears the streak, so if the stream stalls again immediately the streak restarts
+  /// from 0 and the gate would mistake a mid-conversation stall for a fresh start —
+  /// demanding the full 400 ms cushion and muting Joe mid-sentence. That is the exact
+  /// class of bug we are removing, so it must not be reintroduced here.
+  ///
+  /// Once playback has begun, EVERY subsequent gate entry is a recovery and takes the
+  /// shallow cushion. Only the genuine session start takes the deep one.
+  fileprivate var hasStartedPlayback = false
+
+  /// How many consecutive fully-empty callbacks constitute a real stall rather than one
+  /// late chunk. At ~23 ms per callback, 3 ≈ 70 ms of genuinely nothing arriving — well
+  /// past normal chunk variance, and still fast enough to react before it sounds broken.
+  fileprivate static let drainsBeforeRebuffer = 3
+
+  /// Diagnostic: the worst back-to-back drain streak this session. If this stays at 1–2,
+  /// the stream only ever hiccups and the hysteresis is doing its job (we never rebuffer).
+  /// If it climbs, the feed is genuinely stalling and the problem is upstream.
+  fileprivate var maxConsecutiveDrains = 0
 
   // Build 4: actual hardware sample rate read at start (e.g. 48000), kept ONLY
   // for the diagnostic string. Playback no longer converts to it — the output
@@ -371,9 +459,22 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // lastRenderBytesRequested vs lastInputFrames reveals rate/frame shape.
       // Build 3: append priming state (primed / reprimes / threshold) so we can
       // prove the cushion filled and underruns collapsed toward 0.
+      // Build 9: maxDrainStreak is now the KEY number. underruns alone no longer imply a
+      // chop — a short read is absorbed silently by design, and a LOW underrun rate never
+      // meant the audio was clean (Build 8 measured a healthy 0.15% and still chopped,
+      // because the RESPONSE to those few underruns was a 100 ms mute).
+      //
+      // What matters is whether the stream ever went BACK-TO-BACK empty:
+      //   maxDrainStreak 1–2 → only ever a late chunk; hysteresis absorbed it; reprimes
+      //                        should be 0 and the audio should be clean.
+      //   maxDrainStreak ≥3  → the feed genuinely stalled and we rebuffered. If this is
+      //                        high, the problem is UPSTREAM (voiceAdapter / WebSocket /
+      //                        feedPlayback cadence), not the buffer.
       let live = "renderCalls=\(renderCalls); underruns=\(underrunEvents); "
         + "lastReqBytes=\(lastRenderBytesRequested); lastInputFrames=\(lastInputFrames); "
-        + "primed=\(primed); reprimes=\(reprimeEvents); primeThresh=\(primeThresholdBytes)B; "
+        + "primed=\(primed); reprimes=\(reprimeEvents); "
+        + "primeThresh=\(primeThresholdBytes)B; rebufThresh=\(rebufferThresholdBytes)B; "
+        + "maxDrainStreak=\(maxConsecutiveDrains); "
         + "droppedBytes=\(playback.droppedBytes); maxRenderUs=\(maxRenderMicros)"
       result(lastDiagnostics + live)
 
@@ -574,15 +675,33 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     hwRate = grantedRate
     lastDiagnostics += "playbackPath=VPIO-internal-resample(16k→\(Int(hwRate))Hz); "
 
-    // ── Build 3: compute the priming cushion (~100 ms). Playback is now 16 kHz
-    // (the render callback consumes 16 kHz bytes; the unit resamples downstream),
-    // so the cushion is 100 ms of 16 kHz mono PCM16 = 16000 * 2 * 0.1 = 3200 B.
-    let hundredMs = Int(SixPagesVoicePlugin.targetSampleRate * 2.0 * 0.1)
-    primeThresholdBytes = min(hundredMs, SixPagesVoicePlugin.playbackBufferBytes / 2)
+    // ── Build 9: compute BOTH jitter-buffer cushions. Playback bytes are 16 kHz mono
+    // PCM16 (the render callback consumes 16 kHz bytes; VPIO resamples downstream), so
+    // bytes = 16000 * 2 * seconds. Confirmed on-device: lastReqBytes=736 over
+    // lastInputFrames=368 = 2 B/frame, and 368 frames @ 16 kHz = 23.0 ms, which matches
+    // the reported ioBuf of 0.0233 s. The ring units are correct.
+    //
+    // STARTUP = 400 ms (was 100 ms). 100 ms was only ~4.35 render calls deep — far too
+    // thin for a feed that ElevenLabs delivers in bursts. The ring is 30 s, so the
+    // headroom is free; the only cost is 400 ms before Joe's first word, paid once, and
+    // inaudible in a reflective conversation. A deeper buffer is the classic and correct
+    // guard against underrun.
+    //
+    // REBUFFER = 40 ms. Only used after a SUSTAINED stall (see the render callback).
+    // Deliberately shallow: recovery should be fast, because the listener has already
+    // been made to wait once.
+    let startupCushion  = Int(SixPagesVoicePlugin.targetSampleRate * 2.0 * 0.400)
+    let rebufferCushion = Int(SixPagesVoicePlugin.targetSampleRate * 2.0 * 0.040)
+    primeThresholdBytes    = min(startupCushion,  SixPagesVoicePlugin.playbackBufferBytes / 2)
+    rebufferThresholdBytes = min(rebufferCushion, SixPagesVoicePlugin.playbackBufferBytes / 2)
     primed = false
+    hasStartedPlayback = false
     reprimeEvents = 0
-    os_log("Build3: primeThresholdBytes = %d (≈100 ms at %{public}.0f Hz)",
-           log: SixPagesVoicePlugin.log, type: .info, primeThresholdBytes, hwRate)
+    consecutiveDrains = 0
+    maxConsecutiveDrains = 0
+    os_log("Build9: startup cushion = %d B (≈400 ms); rebuffer cushion = %d B (≈40 ms); hw %{public}.0f Hz",
+           log: SixPagesVoicePlugin.log, type: .info,
+           primeThresholdBytes, rebufferThresholdBytes, hwRate)
 
     var desc = AudioComponentDescription(
       componentType: kAudioUnitType_Output,
@@ -708,8 +827,15 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     isRunning = false
     playback.clear()
     capture.clear()
-    // Build 3: reset priming state so a fresh session re-primes cleanly.
+    // Build 9: reset the jitter-buffer state so a fresh session primes cleanly.
+    // consecutiveDrains MUST be cleared here. The gate picks its cushion by asking
+    // "did I get here from a mid-stream stall?" (consecutiveDrains > 0). If a session
+    // ended while draining and we left it nonzero, the NEXT session's startup would
+    // read as a recovery and prime to the shallow 40 ms cushion instead of the deep
+    // 400 ms one — silently reintroducing exactly the thin buffer we just fixed.
     primed = false
+    hasStartedPlayback = false
+    consecutiveDrains = 0
     if let scratch = captureScratch {
       scratch.deallocate()
       captureScratch = nil
@@ -804,12 +930,27 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     let buffers = UnsafeMutableAudioBufferListPointer(abl)
     plugin.renderCalls &+= 1
 
-    // Build 3: priming gate. If not yet primed, wait for the cushion. Emit clean
-    // silence and return WITHOUT counting an underrun — this is intentional
-    // buffering, not a starve.
+    // Build 9: BUFFERING GATE. While not primed, emit clean silence and return WITHOUT
+    // counting an underrun — deliberate buffering is not starving.
+    //
+    // The gate is used in two situations, and they want DIFFERENT depths:
+    //   • startup  → primeThresholdBytes    (~400 ms, deep — paid once, buys headroom)
+    //   • recovery → rebufferThresholdBytes (~40 ms, shallow — the listener already waited)
+    //
+    // hasStartedPlayback — NOT consecutiveDrains — is the correct discriminator. The
+    // gate clears the drain streak on recovery, so a stall that resumes immediately would
+    // present with streak==0 and be misread as a fresh start, demanding the full 400 ms
+    // and muting Joe mid-sentence. Once ANY audio has played this session, every later
+    // gate entry is a recovery.
     if !plugin.primed {
-      if plugin.playback.count >= plugin.primeThresholdBytes {
-        plugin.primed = true   // cushion built; fall through to normal read
+      let needed = plugin.hasStartedPlayback
+        ? plugin.rebufferThresholdBytes
+        : plugin.primeThresholdBytes
+
+      if plugin.playback.count >= needed {
+        plugin.primed = true
+        plugin.consecutiveDrains = 0   // recovered; back to normal playback
+        // fall through to normal read
       } else {
         for buffer in buffers {
           if let mData = buffer.mData {
@@ -817,7 +958,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
           }
         }
         ioActionFlags.pointee.insert(.unitRenderAction_OutputIsSilence)
-        plugin.recordRenderTime(since: renderStart) // Build 8
+        plugin.recordRenderTime(since: renderStart)
         return noErr
       }
     }
@@ -827,19 +968,37 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       let bytesRequested = Int(buffer.mDataByteSize)
       plugin.lastRenderBytesRequested = bytesRequested
       let provided = plugin.playback.read(into: mData, count: bytesRequested)
+
       if provided < bytesRequested {
+        // Short read. Zero-fill ONLY the shortfall and keep going. This is the jitter
+        // buffer absorbing a gap — we do NOT answer a gap by adding more silence.
         plugin.underrunEvents &+= 1
         memset(mData.advanced(by: provided), 0, bytesRequested - provided)
-        // Build 3: a FULL drain (nothing at all provided) on a nonzero request
-        // means the ring emptied mid-stream — a network stall. Re-prime so the
-        // gap re-buffers rather than chopping through the burst gap.
-        if provided == 0 && bytesRequested > 0 {
+      }
+
+      if provided == 0 && bytesRequested > 0 {
+        // FULLY empty callback. On its own this is just ONE late chunk — the old code's
+        // mistake was treating it as a stall and muting for a full 100 ms cushion.
+        // Count it and keep playing; only a RUN of these means the stream really stalled.
+        plugin.consecutiveDrains &+= 1
+        if plugin.consecutiveDrains > plugin.maxConsecutiveDrains {
+          plugin.maxConsecutiveDrains = plugin.consecutiveDrains
+        }
+        if plugin.consecutiveDrains >= SixPagesVoicePlugin.drainsBeforeRebuffer {
+          // Sustained stall confirmed (~70 ms of nothing arriving). Drop into rebuffering
+          // so we recover cleanly instead of machine-gunning ticks — but rebuild only the
+          // SHALLOW 40 ms cushion, never the 400 ms startup one.
           plugin.primed = false
           plugin.reprimeEvents &+= 1
         }
+      } else if provided > 0 {
+        // Real audio went out. The hiccup (if any) is over — reset the streak, and mark
+        // that playback has begun so every future gate entry takes the SHALLOW cushion.
+        plugin.consecutiveDrains = 0
+        plugin.hasStartedPlayback = true
       }
     }
-    plugin.recordRenderTime(since: renderStart) // Build 8
+    plugin.recordRenderTime(since: renderStart)
     return noErr
   }
 
