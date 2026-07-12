@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -48,6 +49,12 @@ class SixPagesVoicePlugin :
     EventChannel.StreamHandler {
 
     private val tag = "SixPagesVoice"
+
+    // --- Audio focus state --------------------------------------------------
+    // REQUIRED by Android for MODE_IN_COMMUNICATION. See requestFocus().
+    private var focusRequest: AudioFocusRequest? = null
+    private var focusListener: AudioManager.OnAudioFocusChangeListener? = null
+    private var focusLossCount = 0
 
     // --- Native AEC3 bridge -------------------------------------------------
     //
@@ -205,6 +212,13 @@ class SixPagesVoicePlugin :
         // holds the partial wakelock that keeps the CPU alive with the screen off.
         appContext?.let { VoiceSessionService.start(it) }
 
+        // FOCUS FIRST, before MODE_IN_COMMUNICATION. That is Google's ordering.
+        // Requesting focus AFTER entering communication mode is how a car's Bluetooth
+        // stack beats us to it. Denial is logged, not fatal - see requestFocus().
+        if (!requestFocus()) {
+            Log.w(tag, "Proceeding WITHOUT audio focus - expect contention (car / BT)")
+        }
+
         routeToSpeaker()
         val playbackOk = startPlayback()
         if (!playbackOk) {
@@ -232,8 +246,99 @@ class SixPagesVoicePlugin :
         stopCapture()
         stopPlayback()
         clearSpeakerRoute()
+        abandonFocus()
         // Last: tears down the notification and releases the wakelock.
         appContext?.let { VoiceSessionService.stop(it) }
+    }
+
+    // --- Audio focus (REQUIRED by Android; we never requested it) ------------
+    //
+    // BUILD: car Bluetooth drop.
+    //
+    // Google's contract: an app that plays or records audio MUST request audio focus,
+    // and MUST register a listener for focus changes. This plugin set
+    // MODE_IN_COMMUNICATION and drove the route WITHOUT EVER ASKING FOR FOCUS.
+    //
+    // That works on a phone on a desk, because nothing else is contending for audio.
+    // In a CAR it does not. The head unit's Bluetooth stack requests focus the moment
+    // it connects. It wins by default — we were never holding any — and the framework
+    // tears our streams down. No callback ever reached us, because we had never
+    // registered a listener to receive one. Symptom: the call opens and drops seconds
+    // later, FASTER than iOS, because the car's stack claims focus almost immediately.
+    //
+    // This is the SAME CLASS OF BUG as the missing iOS interruption handler: a contract
+    // the platform documents and we did not implement. It is NOT a routing override.
+    // Focus is what gives us STANDING to hold the route we are already selecting
+    // correctly. Requesting it is following Android's contract, not imposing ours.
+    //
+    // AUDIOFOCUS_GAIN, not GAIN_TRANSIENT: a conversation with Joe is not a transient
+    // beep. It is the foreground audio activity for as long as it lasts.
+    //
+    // We do NOT fail the session if focus is denied. A denial is logged and we proceed,
+    // so it surfaces in logcat as a DIAGNOSIS instead of a silent no-audio.
+    private fun requestFocus(): Boolean {
+        val am = audioManager() ?: return false
+
+        val listener = AudioManager.OnAudioFocusChangeListener { change ->
+            when (change) {
+                AudioManager.AUDIOFOCUS_LOSS -> {
+                    focusLossCount++
+                    Log.w(tag, "Audio focus LOST permanently (count=$focusLossCount) - another app owns audio")
+                }
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                    focusLossCount++
+                    Log.w(tag, "Audio focus lost TRANSIENTLY (count=$focusLossCount)")
+                }
+                AudioManager.AUDIOFOCUS_GAIN -> {
+                    // Audio is ours again. The route may have been re-evaluated while
+                    // we were out; re-assert it, same as we do after the streams go live.
+                    Log.i(tag, "Audio focus REGAINED - re-asserting route")
+                    selectBestRoute()
+                }
+                else -> Log.i(tag, "Audio focus change: $change")
+            }
+        }
+        focusListener = listener
+
+        val granted: Int
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attrs)
+                .setOnAudioFocusChangeListener(listener, mainHandler)
+                .setAcceptsDelayedFocusGain(false)
+                .setWillPauseWhenDucked(false)
+                .build()
+            focusRequest = req
+            granted = am.requestAudioFocus(req)
+        } else {
+            @Suppress("DEPRECATION")
+            granted = am.requestAudioFocus(
+                listener,
+                AudioManager.STREAM_VOICE_CALL,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+        }
+
+        val ok = granted == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        Log.i(tag, "Audio focus request -> " + if (ok) "GRANTED" else "DENIED (code=$granted)")
+        return ok
+    }
+
+    private fun abandonFocus() {
+        val am = audioManager() ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            focusRequest?.let { am.abandonAudioFocusRequest(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            focusListener?.let { am.abandonAudioFocus(it) }
+        }
+        focusRequest = null
+        focusListener = null
     }
 
     // --- Speaker routing ---
@@ -308,7 +413,10 @@ class SixPagesVoicePlugin :
             } else {
                 @Suppress("DEPRECATION")
                 am.isSpeakerphoneOn = true
-                Log.i(tag, "Route -> speakerphone (no communication device offered)")
+                // Log what WAS offered. If a car head unit enumerates as a type that is
+                // not in routePreference, this line is the ONLY thing that will tell us.
+                val offered = available.joinToString(", ") { "${routeName(it.type)}(${it.type})" }
+                Log.i(tag, "Route -> speakerphone (no preferred device). Offered: [$offered]")
             }
         } else {
             // Pre-S: no setCommunicationDevice(). A connected headset (BT or wired)
