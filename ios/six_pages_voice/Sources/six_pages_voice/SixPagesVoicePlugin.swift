@@ -8,68 +8,70 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// STEP B, LAYER 13 (BUILD 10): REVERT TO THE KNOWN-GOOD BASELINE.
+// STEP B, LAYER 14 (BUILD 11): THE RING WAS TOO SMALL FOR THE TURN.
 //
-// This file is BYTE-IDENTICAL to 7abeb0a (Build 8) except for ONE addition: an
-// OBSERVE-ONLY route listener that logs and steers nothing. That is deliberate.
+// THE ANSWER, after a long night of wrong theories. It is not the route listener, not
+// A2DP, not the jitter buffer, not echo, not a duplicate feed. It is the oldest and
+// simplest failure in this file, and this repo has now hit it THREE times:
 //
-// WHY THIS BUILD EXISTS — read this before "improving" anything here.
+//   THE RING CANNOT HOLD A WHOLE JOE TURN, SO THE END OF THE TURN IS THROWN AWAY.
 //
-// 7abeb0a played a long, multi-turn conversation PERFECTLY on the iPad. That is the
-// bar and it is documented. Everything after it regressed:
+// MEASURED (iPad, July 12, ONE tap of Talk with Claude — confirmed against the
+// ElevenLabs conversation list: 1 conversation, 1m19s, 3 messages, so NO double feed):
+//   droppedBytes = 645178  -> 20.2 s of Joe's audio DELETED before it ever played
+//   ring         = 960000  -> 30.0 s capacity
+//   960000 + 645178 = 1605178 B = 50.2 s = EXACTLY ONE JOE TURN
+//   underruns=4/3117 (0.13%, healthy).  maxRenderUs=42 vs a 23000 deadline (innocent).
+//   BY EAR: playback stopped DEAD mid-sentence at "It's almost like..." — precisely
+//   where 30 s of buffered audio ran out. Everything after that was already discarded.
 //
-//   ae4e8e2  added (a) Bluetooth A2DP+HFP category options and (b) a route listener
-//            that called overrideOutputAudioPort. Long replies began to CHOP.
-//   c95f26c  removed the override from the listener (correct — Apple says never
-//            revert a route change). STILL CHOPPED on device.
-//   01fd01a  (Build 9) rebuilt a deeper priming cushion + re-prime hysteresis to
-//            chase the chop. Caused droppedBytes=913270 — ~28 s of Joe's audio
-//            silently discarded. It ALSO re-made a mistake this repo had already
-//            made and solved: see ea45974 ("deeper 350ms cushion + reprime
-//            hysteresis") and eb1be7a ("real overflow fix; SUPERSEDES ea45974").
+// ElevenLabs ships a turn FASTER THAN REALTIME. The render callback drains at speech
+// rate. So a 50 s turn pours into a 30 s ring in a few seconds; the drop-NEWEST overflow
+// policy discards the excess — and drop-newest means it deletes THE END OF WHAT JOE WAS
+// ABOUT TO SAY. There is no backpressure: feedPlayback is fire-and-forget by design.
 //
-// THE LESSON, which is the whole reason for this build:
+// WHY IT LOOKED LIKE A REGRESSION AND WASN'T: nothing broke. Joe's replies simply GREW
+// PAST 30 SECONDS. The July 9 "perfect" conversation had shorter turns that fit. The
+// droppedBytes=0 that was treated as a baseline was never captured on that conversation
+// (the app was closed before reading it) — so the buffer may have been dropping all
+// along, just not enough to hear.
 //
-//   Every iOS fix that has ever WORKED on this project was a REMOVAL.
-//     • Build 4  — DELETED the AVAudioConverter. VPIO already resamples internally.
-//     • c95f26c  — DELETED overrideOutputAudioPort. VPIO already manages BT/car.
-//     • Build 10 — DELETES the A2DP option. VPIO already handles Bluetooth.
+// FIX: raise the ring to 180 s (5_760_000 B, 5.49 MB). NOT 60 s — the measured turn was
+// already 50 s, and a 60 s ring truncates the next slightly-longer reflection. Joe is a
+// REFLECTION companion; long considered replies are the PRODUCT, not an edge case.
+// 5.49 MB is trivial on an iPad and is allocated once per session.
 //
-//   Android's AudioManager EXPECTS the app to drive the route. iOS's AVAudioSession
-//   does NOT, and VoiceProcessingIO especially does not. We built Android first,
-//   learned Android's contract, and carried its habits across a boundary where they
-//   do not hold. Every time we told iOS how to do its job, we broke it. Every time
-//   we took our hands off, it worked.
+// EVERYTHING ELSE IS BYTE-IDENTICAL TO 7abeb0a (the last known-good build). The prime
+// cushion stays 3200 B (100 ms) — it is a min() against half the ring, so growing the
+// ring does not move it. The ONE other change is an OBSERVE-ONLY route listener that
+// logs and steers NOTHING.
 //
-// WHAT THIS BUILD CHANGES vs c95f26c/01fd01a:
-//   1. Session category options revert to EXACTLY 7abeb0a's:
-//        [.defaultToSpeaker, .allowBluetooth]
-//      .allowBluetoothA2DP is REMOVED. A2DP is an OUTPUT-ONLY profile with no mic
-//      path; adding it to a .playAndRecord + VPIO session is the last unreverted
-//      delta between the build that worked and the build that chops. Bluetooth HFP
-//      (bidirectional — the profile a conversation actually needs) is retained via
-//      .allowBluetooth.
-//   2. The playback buffer is restored to 7abeb0a EXACTLY. No deeper cushion. No
-//      rebuffer gate. No hysteresis. The 100 ms startup prime and the re-prime are
-//      untouched, because 7abeb0a SHIPPED WITH THEM AND WAS PERFECT.
+// ── HARD-WON RULES. READ BEFORE CHANGING ANYTHING IN THIS FILE. ──────────────
 //
-// WHAT THIS BUILD DELIBERATELY DOES NOT DO:
-//   It does not "improve" the buffer. 7abeb0a's buffer worked. Changing a proven
-//   variable while hunting a regression is how the last three builds went wrong.
-//   ONE VARIABLE. If this build is clean, the A2DP option was the cause — proven,
-//   not argued. If it still chops, the buffer is exonerated (droppedBytes should be
-//   0) and we have clean data for the first time.
+// 1. DIAGNOSTIC READ ORDER: droppedBytes FIRST. >0 means OVERFLOW — the ring is too
+//    small and Joe's later audio is being deleted. That is a COMPLETE explanation of
+//    "degrades late in long replies" and "the ending is missing." Look no further.
 //
-// DIAGNOSTIC READ ORDER (do not deviate):
-//   1. droppedBytes  — >0 means OVERFLOW. ElevenLabs feeds FASTER THAN REALTIME, so
-//      the ring's natural failure is overflow, NOT starvation. Low underruns plus an
-//      audio problem means OVERFLOW. Never answer that with a deeper cushion.
-//   2. maxRenderUs   — deadline is ~23000 µs. A reading near 25-32 means the callback
-//      is using ~0.1% of its budget and is INNOCENT. This number stops wrong fixes.
-//   3. underruns     — a low rate (<2%) with bad audio does NOT mean starvation.
+// 2. LOW UNDERRUNS + BAD AUDIO = OVERFLOW, NOT STARVATION. This signal has now been
+//    misread three times. ElevenLabs OUTRUNS the drain, always. The ring's natural
+//    failure is overflow. NEVER answer it with a deeper cushion or a rebuffer gate:
+//    those PAUSE THE DRAIN and make overflow WORSE. (See ea45974, tried and superseded
+//    by eb1be7a; then re-made as Build 9 (01fd01a), which caused droppedBytes=913270.)
 //
-// UNCHANGED and CORRECT: lock-free SPSC ring, memcpy copies, 30 s ring, VPIO 16k
-// internal resample, priming gate, capture path, the entire Android side.
+// 3. maxRenderUs ~25-42 against a 23000 deadline means the render callback is using
+//    ~0.1% of its budget and is INNOCENT. This number exists to STOP WRONG FIXES.
+//
+// 4. EVERY iOS FIX THAT HAS EVER WORKED HERE WAS A REMOVAL:
+//      Build 4 deleted the AVAudioConverter  — VPIO already resamples internally.
+//      c95f26c deleted overrideOutputAudioPort — VPIO already manages BT/car routing.
+//      Build 10 deleted .allowBluetoothA2DP  — VPIO already handles Bluetooth.
+//    Android's AudioManager EXPECTS the app to drive the route. iOS does NOT. Importing
+//    the Android mechanism across that boundary is what caused the ae4e8e2 regression.
+//
+// 5. DO NOT "optimize" the ring back down. Read droppedBytes. It must be 0.
+//
+// UNCHANGED and CORRECT: lock-free SPSC ring, memcpy copies, VPIO 16k internal resample,
+// the priming gate, the capture path, and the ENTIRE Android side.
 // ───────────────────────────────────────────────────────────────────────────
 //
 // Frame contract mirrors Android exactly: PCM16 / 16 kHz / mono, 640-byte
@@ -301,17 +303,37 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // Frame contract (mirrors Android): 640 bytes = 20 ms of 16 kHz mono PCM16.
   private static let frameBytes = 640
 
-  // Playback ring: Build 7 — sized to hold the LONGEST turn (Joe's session
-  // summary is the worst case) without overflowing. ElevenLabs delivers a turn
-  // FASTER than realtime, so a ring smaller than the turn fills mid-turn and the
-  // drop-newest overflow discards Joe's later audio → "starts great, stumbles
-  // mid/late." Build 5's 15 s (480000 B) filled mid-turn on longer replies.
-  // 30 s of 16 kHz mono PCM16 = 16000 * 2 * 30 = 960000 B (~938 KB — trivial).
-  // The droppedBytes diagnostic will confirm whether 30 s is enough; if a turn
-  // ever exceeds it, raise again (reflections are bounded, so a finite ring is
-  // the right practical fix — true backpressure isn't feasible over the fire-
-  // and-forget method channel).
-  private static let playbackBufferBytes = 960000
+  // Playback ring: sized to hold the LONGEST turn Joe can produce, without overflow.
+  //
+  // ElevenLabs synthesizes a whole turn in a few seconds and streams it to us FASTER
+  // THAN REALTIME. The render callback drains at natural speech rate (~1 s of audio per
+  // 1 s). So the ring must hold an ENTIRE turn — whatever arrives beyond its capacity is
+  // discarded by the drop-newest overflow policy, which silently deletes the END of what
+  // Joe was about to say. There is no backpressure to fall back on: feedPlayback is
+  // fire-and-forget across the method channel, by design.
+  //
+  // SIZING HISTORY — this has now been raised THREE times, and each time the reason was
+  // the same: a real reply outgrew the ring.
+  //   Build 5  (eb1be7a):  15 s (480000 B)  — "sentences piling on top of each other"
+  //   Build 7  (b99678b):  30 s (960000 B)  — "starts great, stumbles mid/late"
+  //   Build 11 (this):    180 s (5760000 B) — playback died mid-sentence at ~30 s
+  //
+  // MEASURED, July 12 (iPad, one turn, ONE tap — verified against the ElevenLabs
+  // conversation list, so no duplicate feed):
+  //   renderCalls=3117 (~73 s session); droppedBytes=645178 (20.2 s of audio DELETED);
+  //   underruns=4 (0.13% — healthy); maxRenderUs=42 (deadline 23000 — callback innocent).
+  //   960000 (held) + 645178 (dropped) = 1605178 B = 50.2 s — EXACTLY one Joe turn.
+  //   By ear: playback stopped dead mid-sentence at "It's almost like..." — the point
+  //   where 30 s of buffered audio ran out. Everything after it was already discarded.
+  //
+  // WHY 180 s AND NOT 60 s: the measured turn was already 50 s. A 60 s ring passes that
+  // test with 10 s to spare and truncates the next slightly-longer reflection. Joe is a
+  // REFLECTION companion — long, considered replies are the PRODUCT, not an edge case.
+  // 5.49 MB is trivial on an iPad and is allocated ONCE per session, not per turn. This
+  // is a place where "too big" costs nothing and "too small" costs a lost conversation.
+  //
+  // DO NOT "optimize" this back down. Read droppedBytes instead: it must be 0.
+  private static let playbackBufferBytes = 5_760_000   // 180 s of 16 kHz mono PCM16
   private let playback = ByteRingBuffer(capacityBytes: playbackBufferBytes)
 
   // Capture ring: ~500 ms of clean mic audio waiting to drain up to Dart.
