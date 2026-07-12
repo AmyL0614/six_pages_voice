@@ -8,6 +8,39 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
+// BUILD 12: INTERRUPTION HANDLING. THE CONTRACT WE NEVER IMPLEMENTED.
+//
+// Symptom: connect the iPad to a CAR over Bluetooth, the call opens and then DROPS
+// about four seconds later. Android showed the same shape (see its focus commit).
+//
+// This file registered a route-change observer and NOTHING ELSE. It never observed
+// AVAudioSession.interruptionNotification. Apple documents interruption handling as
+// MANDATORY for a .playAndRecord session: on .began the OS suspends your audio unit,
+// on .ended you are expected to reactivate. A car head unit negotiating HFP routinely
+// fires exactly that pair within seconds of connecting. Unhandled, the OS stopped our
+// unit and nobody ever restarted it — the session opened, then died. Precisely the
+// reported symptom, and precisely the delay.
+//
+// READ THIS BEFORE CALLING IT A ROUTING CHANGE. It is not one:
+//   - Route CONTROL is iOS's job. We deleted overrideOutputAudioPort (c95f26c) and
+//     .allowBluetoothA2DP (Build 10) and were right both times. Hands OFF the route.
+//   - Interruption RESPONSE is OUR job. Apple says so. Not implementing it is us
+//     FAILING the platform's contract, not respecting it. Opposite direction, same rule.
+//
+// The restraint is deliberate and is the whole lesson of this repo:
+//   .began  — count it, log it, do nothing. We do NOT stopUnit(): that would dispose
+//             the unit and clear the 180 s ring. We want to RESUME, not restart.
+//   .ended  — resume ONLY if the system grants .shouldResume. If it does not, the
+//             interruptor still owns the audio session, and forcing our way back in
+//             is exactly the kind of override that has broken this file before.
+//             We stand down and log it.
+//
+// Diagnostics: interruptionCount / interruptionResumeFailures. The car drive is the
+// instrument. If "Interruption BEGAN" never fires, the diagnosis was wrong and we
+// look elsewhere WITH DATA instead of guessing. Unproven in a car as of this commit.
+//
+// ── PRIOR ──────────────────────────────────────────────────────────────────
+//
 // STEP B, LAYER 14 (BUILD 11): THE RING WAS TOO SMALL FOR THE TURN.
 //
 // THE ANSWER, after a long night of wrong theories. It is not the route listener, not
@@ -298,6 +331,13 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   /// Live only for the duration of a session; removed in stopUnit().
   private var routeObserver: NSObjectProtocol?
 
+  /// Live only for the duration of a session; removed in stopUnit().
+  private var interruptionObserver: NSObjectProtocol?
+
+  /// Diagnostics. Proves whether the car actually interrupted the session.
+  private var interruptionCount = 0
+  private var interruptionResumeFailures = 0
+
   private static let targetSampleRate: Double = 16000.0
 
   // Frame contract (mirrors Android): 640 bytes = 20 ms of 16 kHz mono PCM16.
@@ -498,6 +538,108 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     }
   }
 
+  // MARK: - Interruption handling (REQUIRED by Apple for .playAndRecord)
+  //
+  // This is NOT a routing override and does not violate the hands-off rule above.
+  // Route CONTROL is iOS's job — we deleted overrideOutputAudioPort and were right to.
+  // Interruption RESPONSE is OUR job, and Apple documents it as mandatory:
+  //
+  //   "Your app must respond to an interruption [...] and, when the interruption ends,
+  //    reactivate the audio session."   — AVAudioSession: Handling Audio Interruptions
+  //
+  // We never implemented it. That is a contract we OWE the platform, not one we are
+  // imposing on it. Every phone call, Siri invocation, alarm — and the reason we
+  // found this, every CAR BLUETOOTH CONNECT — can interrupt a .playAndRecord session.
+  // A car head unit negotiating HFP commonly fires .began then .ended within seconds
+  // of connecting. Unhandled, the OS suspends our AudioUnit and NOBODY restarts it.
+  // The session "opens, then dies four seconds later." That is the exact symptom.
+  //
+  //   .began — the OS has ALREADY stopped the unit. Do not fight it. Count it, wait.
+  //            We deliberately do NOT call stopUnit(): that would dispose the unit and
+  //            clear the ring. We want to RESUME, not restart from nothing.
+  //   .ended — reactivate and restart the unit, but ONLY if the system grants
+  //            .shouldResume. If it does not, the interruptor still owns audio and
+  //            forcing our way back in is exactly the kind of override that has
+  //            broken this plugin before. We stand down and log it.
+  private func registerInterruptionListener() {
+    guard interruptionObserver == nil else { return }
+    interruptionObserver = NotificationCenter.default.addObserver(
+      forName: AVAudioSession.interruptionNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] note in
+      self?.handleInterruption(note)
+    }
+  }
+
+  private func unregisterInterruptionListener() {
+    if let observer = interruptionObserver {
+      NotificationCenter.default.removeObserver(observer)
+      interruptionObserver = nil
+    }
+  }
+
+  private func handleInterruption(_ note: Notification) {
+    guard
+      let info = note.userInfo,
+      let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+      let type = AVAudioSession.InterruptionType(rawValue: raw)
+    else { return }
+
+    switch type {
+    case .began:
+      interruptionCount += 1
+      os_log("Interruption BEGAN (count=%d) - OS has suspended the audio unit",
+             log: SixPagesVoicePlugin.log, type: .info, interruptionCount)
+
+    case .ended:
+      var shouldResume = false
+      if let optsRaw = info[AVAudioSessionInterruptionOptionKey] as? UInt {
+        shouldResume = AVAudioSession.InterruptionOptions(rawValue: optsRaw).contains(.shouldResume)
+      }
+      os_log("Interruption ENDED (shouldResume=%{public}@)",
+             log: SixPagesVoicePlugin.log, type: .info, shouldResume ? "true" : "false")
+
+      guard shouldResume else {
+        interruptionResumeFailures += 1
+        os_log("Interruption ENDED without shouldResume - standing down (failures=%d)",
+               log: SixPagesVoicePlugin.log, type: .info, interruptionResumeFailures)
+        return
+      }
+      guard isRunning else {
+        os_log("Interruption ENDED but no session is running - nothing to resume",
+               log: SixPagesVoicePlugin.log, type: .info)
+        return
+      }
+
+      do {
+        try AVAudioSession.sharedInstance().setActive(true)
+        if let unit = ioUnit {
+          let status = AudioOutputUnitStart(unit)
+          if status == noErr {
+            // The ring survived; the unit did not. Re-prime so playback does not
+            // resume into a half-empty buffer and immediately underrun.
+            primed = false
+            os_log("Interruption resume OK - unit restarted, re-priming",
+                   log: SixPagesVoicePlugin.log, type: .info)
+          } else {
+            interruptionResumeFailures += 1
+            os_log("Interruption resume FAILED - AudioOutputUnitStart status=%d",
+                   log: SixPagesVoicePlugin.log, type: .error, Int(status))
+          }
+        }
+      } catch {
+        interruptionResumeFailures += 1
+        os_log("Interruption resume FAILED - setActive threw: %{public}@",
+               log: SixPagesVoicePlugin.log, type: .error, error.localizedDescription)
+      }
+      logCurrentRoute(prefix: "Route after interruption")
+
+    @unknown default:
+      break
+    }
+  }
+
   private func logCurrentRoute(prefix: String = "Route") {
     let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
     let name = outputs.first.map { routeName($0.portType) } ?? "none"
@@ -533,6 +675,10 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
     // Observe-only: report the route, steer nothing. See the comment block above.
     registerRouteListener()
+    // Apple REQUIRES this for .playAndRecord. Its absence is the car-drop suspect.
+    registerInterruptionListener()
+    interruptionCount = 0
+    interruptionResumeFailures = 0
     logCurrentRoute(prefix: "Route at start")
 
     // ── Layer 4 instrumentation: what rate did the hardware ACTUALLY grant? ───
@@ -708,6 +854,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     // Drop the route listener BEFORE deactivating the session, so a deactivation-
     // triggered route change cannot call back into a half-torn-down engine.
     unregisterRouteListener()
+    unregisterInterruptionListener()
     try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
   }
 
