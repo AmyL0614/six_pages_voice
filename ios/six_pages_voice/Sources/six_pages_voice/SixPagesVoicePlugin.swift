@@ -8,6 +8,50 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
+// BUILD 14: THE CAR FIX. .defaultToSpeaker WAS OVERRIDING THE CAR AWAY.
+//
+// UNTESTED IN A CAR AS OF THIS COMMIT. Build 13's diagnostic is what found it.
+//
+// MEASURED (iPad, in a car):
+//     routeAtStart=bluetooth; route=speaker; routeChanges=2;
+//     why=[categoryChange>bluetooth | override>speaker]
+//
+// WE GET THE CAR. THEN WE TAKE IT AWAY FROM OURSELVES. `override` has exactly one source
+// in AVFoundation, and this plugin makes no overrideOutputAudioPort call — c95f26c deleted
+// it. The only remaining mechanism is the .defaultToSpeaker CATEGORY OPTION, set once in
+// startUnit() and never revisited. The car finishes negotiating, iOS re-evaluates, our
+// standing .defaultToSpeaker reasserts, and the car is gone. ~5 seconds in. Every time.
+//
+// THE FIX IS NOT TO DELETE IT. That would ship a broken iPhone, and we would never see it:
+//   - VPIO requires mode .voiceChat (platform AEC only exists in voiceChat — and AEC is
+//     the entire reason this plugin exists; mode .default kills it).
+//   - In .voiceChat, a bare iPhone with no accessory routes output to the RECEIVER, not
+//     the speaker. .defaultToSpeaker is the ONLY thing preventing that.
+//   - THE iPAD HAS NO EARPIECE. The bug would be INVISIBLE on our only test device.
+//
+// One flag, two contradictory requirements:
+//     alone               -> .defaultToSpeaker REQUIRED  (or iPhone -> earpiece)
+//     car/headset present -> .defaultToSpeaker POISONOUS (it overrides the route away)
+//
+// A flag set ONCE cannot satisfy both. That is the bug — not the flag, but the fact that
+// we set it at startup and never looked at it again. So: re-evaluate on every route change.
+// Drop it when a real output device appears; restore it when we are bare again. See
+// applySpeakerPolicy(). Apple's header says VPIO auto-manages CarAudio and BluetoothHFP.
+// It always could. We were overriding it. Again.
+//
+// STILL A REMOVAL. We select no route and call no override. We remove OUR OWN standing
+// override so iOS can do its job. Hands-off, correctly applied.
+//
+// DANGER: setCategory() fires a routeChange(categoryChange) which RE-ENTERS the observer
+// which calls the policy again. The `wanted != speakerDefaultOn` guard in applySpeakerPolicy
+// is the ONLY thing that terminates that loop. DO NOT REMOVE IT.
+//
+// New strip fields: spkDefault, policyApplies, policyFails.
+// EXPECTED IN THE CAR: why=[... | categoryChange>bluetooth], route=bluetooth, spkDefault=off,
+// policyApplies=1, policyFails=0, and NO `override>speaker` anywhere.
+//
+// ── PRIOR ──────────────────────────────────────────────────────────────────
+//
 // BUILD 13: THE ROUTE OBSERVER WAS THROWING AWAY THE ANSWER.
 //
 // MEASURED IN THE CAR (iPad, July 12): interruptions=0; resumeFails=0; route=speaker;
@@ -389,6 +433,16 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   private var routeAtStart = "?"
   private var routeHistory: [String] = []   // reason>route, capped; the whole story in one field
 
+  /// Build 14: speaker-policy state. See applySpeakerPolicy().
+  /// `speakerDefaultOn` mirrors whether .defaultToSpeaker is CURRENTLY in the category
+  /// options. It exists so the policy can be idempotent — re-setting an unchanged
+  /// category fires ANOTHER routeChange(categoryChange), which re-enters this handler.
+  /// Without this guard that is an infinite loop. This is the single most dangerous
+  /// line in the build; do not remove it.
+  private var speakerDefaultOn = true
+  private var policyApplyCount = 0
+  private var policyFailCount = 0
+
   private static let targetSampleRate: Double = 16000.0
 
   // Frame contract (mirrors Android): 640 bytes = 20 ms of 16 kHz mono PCM16.
@@ -532,7 +586,9 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         + "droppedBytes=\(playback.droppedBytes); maxRenderUs=\(maxRenderMicros); "
         + "interruptions=\(interruptionCount); resumeFails=\(interruptionResumeFailures); "
         + "routeAtStart=\(routeAtStart); route=\(liveRoute); "
-        + "routeChanges=\(routeChangeCount); why=[\(routeHistory.joined(separator: " | "))]"
+        + "routeChanges=\(routeChangeCount); spkDefault=\(speakerDefaultOn ? "on" : "off"); "
+        + "policyApplies=\(policyApplyCount); policyFails=\(policyFailCount); "
+        + "why=[\(routeHistory.joined(separator: " | "))]"
       result(lastDiagnostics + live)
 
     case "feedPlayback":
@@ -581,6 +637,134 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // DOES expect the app to select the device, and there we re-assert deliberately.
   // iOS does not. Importing the Android mechanism across that boundary was the bug.
   // Symmetry in the LOGS is good. Symmetry in the MECHANISM is not.
+
+  // MARK: - Speaker policy (Build 14) — THE CAR FIX
+  //
+  // MEASURED (iPad, in a car, July 12):
+  //     routeAtStart=bluetooth; route=speaker; routeChanges=2;
+  //     why=[categoryChange>bluetooth | override>speaker]
+  //
+  // We GET the car. Then WE TAKE IT AWAY FROM OURSELVES. `override` has exactly one
+  // source in AVFoundation — the output port being overridden to the speaker — and this
+  // plugin makes no overrideOutputAudioPort call (c95f26c deleted it). The only remaining
+  // mechanism in our code is the .defaultToSpeaker CATEGORY OPTION, set once at startUnit()
+  // and never revisited. When the car finishes negotiating, iOS re-evaluates the route,
+  // our standing .defaultToSpeaker reasserts itself, and the car is gone. ~5 seconds in.
+  //
+  // Apple's AVAudioSession header, on our exact audio unit:
+  //   "if using Apple's Voice Processing I/O unit (kAudioUnitSubType_VoiceProcessingIO),
+  //    the system will automatically manage this for the application. In particular,
+  //    ports of type AVAudioSessionPortBluetoothHFP and AVAudioSessionPortCarAudio..."
+  // VPIO ALREADY KNOWS HOW TO HANDLE THE CAR. We were overriding it. Again.
+  //
+  // ── WHY WE CANNOT SIMPLY DELETE .defaultToSpeaker ─────────────────────────────
+  //
+  // Because it is LOAD-BEARING, and deleting it would ship a broken iPhone.
+  //
+  // With mode .voiceChat (which VPIO REQUIRES — platform AEC is only enabled in
+  // AVAudioSessionModeVoiceChat, and AEC is the entire reason this plugin exists),
+  // a bare iPhone with no accessory routes output to the RECEIVER (the earpiece),
+  // not the speaker. Joe would be inaudible unless the phone were held to an ear.
+  // .defaultToSpeaker is what prevents that. The iPad HAS NO EARPIECE, so this bug
+  // would have been INVISIBLE on our only test device and would have shipped.
+  //
+  // (Do not "fix" it by switching to mode .default either. That kills platform AEC.
+  //  Twilio tried exactly that and reported the echo cancellation gone.)
+  //
+  // ── THE ACTUAL CONSTRAINT ─────────────────────────────────────────────────────
+  //
+  // One flag, two contradictory requirements, decided by what is plugged in:
+  //     NO external device  -> .defaultToSpeaker REQUIRED   (or iPhone -> earpiece)
+  //     car/headset present -> .defaultToSpeaker POISONOUS  (it overrides the route away)
+  //
+  // A flag set once at startup CANNOT satisfy both. That is the bug. Not the flag —
+  // the fact that we set it once and never looked at it again.
+  //
+  // So: re-evaluate it whenever the route changes. Drop .defaultToSpeaker when a real
+  // output device is present (and let VPIO do the CarAudio/HFP management Apple says it
+  // already does), restore it when we are back to the bare device.
+  //
+  // This is NOT us steering the route. We select nothing. We call no override. We are
+  // REMOVING OUR OWN STANDING OVERRIDE so that iOS can do its job — which is the
+  // hands-off rule correctly applied, not a violation of it. Every iOS fix that has
+  // worked in this repo was a removal; this one is a removal that knows when to apply.
+  //
+  // Expected behavior, and the spec this was written against:
+  //   driving, get in car, car connects  -> oldDevice/newDevice fires -> policy drops
+  //                                         .defaultToSpeaker -> VPIO takes CarAudio
+  //   park, shut the car off             -> oldDeviceUnavailable fires -> policy restores
+  //                                         .defaultToSpeaker -> audio returns to speaker
+  // i.e. it behaves like a phone call. Which is what it is.
+
+  /// Ports that mean "a real output device the user chose." If any of these is the
+  /// current output, .defaultToSpeaker must be OFF or it will override the route away.
+  /// carAudio and bluetoothHFP are the two Apple explicitly names as VPIO-managed.
+  private static let externalOutputPorts: Set<AVAudioSession.Port> = [
+    .carAudio,
+    .bluetoothHFP,
+    .bluetoothA2DP,
+    .bluetoothLE,
+    .headphones,
+    .headsetMic,
+    .usbAudio,
+    .airPlay,
+    .lineOut,
+    .HDMI
+  ]
+
+  private func hasExternalOutput() -> Bool {
+    let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+    for port in outputs {
+      if SixPagesVoicePlugin.externalOutputPorts.contains(port.portType) { return true }
+    }
+    return false
+  }
+
+  /// Re-evaluate whether .defaultToSpeaker belongs in the category options RIGHT NOW.
+  ///
+  /// IDEMPOTENT BY CONSTRUCTION. setCategory() itself fires a routeChange(categoryChange),
+  /// which re-enters the route observer, which calls this again. If this method set the
+  /// category unconditionally, that is an INFINITE LOOP. The `wanted == speakerDefaultOn`
+  /// early return is the only thing standing between us and that loop. Leave it alone.
+  ///
+  /// FAILURE IS NON-FATAL AND MUST STAY THAT WAY. If setCategory throws mid-session
+  /// (it can — a live VPIO unit is not guaranteed to accept a category change), we log,
+  /// count it onto the strip, and LEAVE THE EXISTING CATEGORY ALONE. A car that will not
+  /// route is annoying. A conversation that dies is unacceptable. Joe keeps talking no
+  /// matter what the routing does.
+  private func applySpeakerPolicy(reason: String) {
+    let external = hasExternalOutput()
+    let wanted = !external   // .defaultToSpeaker ON only when we are alone
+
+    guard wanted != speakerDefaultOn else {
+      os_log("Speaker policy (%{public}@): unchanged (defaultToSpeaker=%{public}@)",
+             log: SixPagesVoicePlugin.log, type: .info,
+             reason, speakerDefaultOn ? "on" : "off")
+      return
+    }
+
+    var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
+    if wanted { options.insert(.defaultToSpeaker) }
+
+    do {
+      // Category only. Mode stays .voiceChat — VPIO requires it for platform AEC.
+      // We do NOT deactivate/reactivate the session: the unit is running, the ring is
+      // full of Joe, and tearing the session down mid-turn would lose audio.
+      try AVAudioSession.sharedInstance().setCategory(
+        .playAndRecord, mode: .voiceChat, options: options)
+      speakerDefaultOn = wanted
+      policyApplyCount += 1
+      os_log("Speaker policy (%{public}@): defaultToSpeaker -> %{public}@ (external=%{public}@)",
+             log: SixPagesVoicePlugin.log, type: .info,
+             reason, wanted ? "ON" : "OFF", external ? "yes" : "no")
+    } catch {
+      // Do NOT touch speakerDefaultOn — it still describes the category actually in force.
+      policyFailCount += 1
+      os_log("Speaker policy (%{public}@): setCategory FAILED — %{public}@",
+             log: SixPagesVoicePlugin.log, type: .error,
+             reason, error.localizedDescription)
+    }
+  }
 
   /// Build 13: iOS names the cause of every route change. Decode it.
   ///
@@ -650,6 +834,14 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       os_log("Route change #%d: reason=%{public}@ -> %{public}@",
              log: SixPagesVoicePlugin.log, type: .info,
              self.routeChangeCount, reason, now)
+
+      // Build 14: re-evaluate .defaultToSpeaker for the route we are NOW on.
+      // Only while running — a route change after teardown must not resurrect anything.
+      // NOTE: this can itself fire a categoryChange route notification and re-enter here.
+      // applySpeakerPolicy() is idempotent; that is what makes the re-entry terminate.
+      if self.isRunning {
+        self.applySpeakerPolicy(reason: reason)
+      }
     }
   }
 
@@ -795,6 +987,12 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
     let session = AVAudioSession.sharedInstance()
     do {
+      // Start from the SAFE default: .defaultToSpeaker ON. If we are alone (the common
+      // case, and the only case on a bare iPhone), this is exactly right and prevents
+      // the earpiece. If a car or headset is already attached, applySpeakerPolicy()
+      // below removes it immediately, once the session is active and the real route
+      // is known. Starting with it ON is the fail-safe direction: the worst case is a
+      // brief moment on the speaker, not a silent iPhone.
       try session.setCategory(.playAndRecord, mode: .voiceChat,
                               options: [.defaultToSpeaker, .allowBluetooth])
       try session.setPreferredSampleRate(SixPagesVoicePlugin.targetSampleRate)
@@ -811,12 +1009,22 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     interruptionResumeFailures = 0
     routeChangeCount = 0
     routeHistory = []
+    // Mirrors the category we just set above. MUST match, or the idempotence guard lies.
+    speakerDefaultOn = true
+    policyApplyCount = 0
+    policyFailCount = 0
     // Where did we BEGIN? route= on the strip is post-hoc and only says where we ENDED.
     // Without this, "route=speaker" cannot distinguish "never got the car" from
     // "got the car and lost it" — two different bugs.
     let startOutputs = session.currentRoute.outputs
     routeAtStart = startOutputs.first.map { routeName($0.portType) } ?? "none"
     logCurrentRoute(prefix: "Route at start")
+
+    // Build 14: the session is ACTIVE now, so currentRoute is real. If a car or headset
+    // was already connected when the user tapped Talk, drop .defaultToSpeaker before it
+    // has a chance to override the route away. isRunning is not set yet at this point,
+    // so the observer's isRunning guard would skip it — call it directly.
+    applySpeakerPolicy(reason: "start")
 
     // ── Layer 4 instrumentation: what rate did the hardware ACTUALLY grant? ───
     // This is the risk-1 verdict. If actualRate == 16000, our clean path is
