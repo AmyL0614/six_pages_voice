@@ -910,7 +910,14 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   /// call -- Apple: "Only create one instance of CXProvider."
   private func ensureCallKit() {
     if callProvider == nil {
-      let config = CXProviderConfiguration()
+      // BUILD 19 FIX: CXProviderConfiguration() -- the NO-ARGUMENT init -- is iOS 14+ only,
+      // and this plugin's deployment target is below that. Codemagic caught it:
+      // "'init()' is only available in iOS 14.0 or newer."
+      //
+      // The localizedName init has existed since CallKit shipped in iOS 10 and is available
+      // on every version we support. The name is what the system call UI displays, so this
+      // is not a workaround -- it is the init we should have used in the first place.
+      let config = CXProviderConfiguration(localizedName: "Six Pages")
       config.supportsVideo = false
       config.maximumCallGroups = 1
       config.maximumCallsPerCallGroup = 1
@@ -1887,6 +1894,17 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   }
 
   private func buildAndStartUnit() throws {
+    // BUILD 19 FIX: `session` used to be a local `let` inside startUnit()'s do-block. The
+    // Phase 1 / Phase 2 split left that binding behind in configureSession(), and this
+    // function -- which reads session.sampleRate, session.ioBufferDuration and
+    // session.currentRoute -- was orphaned from it. Codemagic caught it three times:
+    // "Cannot find 'session' in scope."
+    //
+    // sharedInstance() is a singleton, so this is the SAME session configureSession()
+    // just set up and the SAME one iOS activated at call priority. Re-binding it here is
+    // correct, not a patch over a lifetime problem.
+    let session = AVAudioSession.sharedInstance()
+
     // Observe-only: report the route, steer nothing. See the comment block above.
     registerRouteListener()
     // Apple REQUIRES this for .playAndRecord. Its absence is the car-drop suspect.
