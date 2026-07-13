@@ -906,6 +906,48 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   private var callKitState = "none"        // none | requested | active | ended
   private var callKitActivateCount = 0     // did provider(didActivate:) EVER fire?
 
+  // ══ BUILD 19b: THE ASYNC SEAM ═════════════════════════════════════════════
+  // Build 19 BROKE THE DART CONTRACT and it took a dead button to find out.
+  //
+  // Dart's voiceSendMic() does:  final bool ok = await _voice.start();
+  //                              if (!ok) { ...bail... }
+  // and then voiceConnectTest() immediately sets _voicePlaybackReady = true and starts
+  // shoving Joe's audio at feedPlayback().
+  //
+  // That contract is: WHEN start() RESOLVES TRUE, THE ENGINE IS RUNNING.
+  //
+  // For eighteen builds startUnit() was SYNCHRONOUS and honored it. Build 19 made it
+  // ASYNCHRONOUS -- it now configures the session, asks CallKit for a call, and RETURNS,
+  // with the VPIO unit built later inside provider(didActivate:). But it still answered
+  // result(true) immediately. So Dart was told "engine ready," began feeding a plugin
+  // with NO AUDIO UNIT, and captureStream had nothing to emit. Dead button.
+  //
+  // I changed the lifecycle and never checked the caller. That is the whole bug.
+  //
+  // THE FIX -- HONOR THE CONTRACT INSTEAD OF REWRITING DART TO MATCH MY MISTAKE:
+  // hold the FlutterResult and do not answer it until didActivate has actually fired and
+  // beginAudio() has the unit running. start() becomes genuinely async on the wire, and
+  // Dart's `await` does exactly what it always did. NOTHING IN DART CHANGES.
+  //
+  // A TIMEOUT IS MANDATORY, NOT OPTIONAL. If didActivate never arrives -- the documented
+  // first-launch CallKit bug -- an unanswered FlutterResult hangs the Dart future FOREVER
+  // and the button is dead with no error. Fail LOUDLY at 4s: result(false), which Dart
+  // already knows how to handle ("plugin start() returned FALSE - engine did NOT open").
+  private var pendingStartResult: FlutterResult?
+  private var startTimeoutWork: DispatchWorkItem?
+
+  /// Answer Dart EXACTLY ONCE. didActivate, the timeout, and the failure path can all
+  /// race to get here; whichever arrives first wins and the rest are no-ops.
+  private func resolveStart(_ value: Bool) {
+    startTimeoutWork?.cancel()
+    startTimeoutWork = nil
+    guard let pending = pendingStartResult else { return }
+    pendingStartResult = nil
+    os_log("start: resolving Dart future -> %{public}@",
+           log: SixPagesVoicePlugin.log, type: .info, value ? "TRUE" : "FALSE")
+    pending(value)
+  }
+
   /// Lazily built, held for the life of the plugin. CXProvider must not be recreated per
   /// call -- Apple: "Only create one instance of CXProvider."
   private func ensureCallKit() {
@@ -1144,16 +1186,53 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "start":
+      // BUILD 19b: DO NOT ANSWER result() HERE. See resolveStart() and the comment block
+      // on pendingStartResult. Under CallKit the engine does not exist yet at this point
+      // -- iOS builds it for us, later, in provider(didActivate:). Answering true now
+      // tells Dart "engine ready" while there is no audio unit, and Dart then feeds Joe
+      // into nothing. That was the dead button.
+      //
+      // The FlutterResult is HELD and answered from resolveStart(), called either from
+      // beginAudio() on success or from the 4-second timeout on failure.
+      if isRunning {
+        // Already running. Answer immediately; do not re-enter the CallKit dance.
+        result(true)
+        return
+      }
+      if pendingStartResult != nil {
+        // A start is already in flight. Refuse the second one rather than orphaning the
+        // first FlutterResult -- an unanswered result hangs a Dart future forever.
+        os_log("start: IGNORED — a start is already awaiting didActivate",
+               log: SixPagesVoicePlugin.log, type: .error)
+        result(false)
+        return
+      }
+
+      pendingStartResult = result
+
+      // THE DEADMAN. If didActivate never arrives (the documented first-launch CallKit
+      // bug), this is the ONLY thing standing between the user and a permanently dead
+      // button. Fail loudly, in a way Dart already handles.
+      let timeout = DispatchWorkItem { [weak self] in
+        guard let self = self else { return }
+        guard self.pendingStartResult != nil else { return }
+        os_log("start: TIMED OUT — provider(didActivate:) never fired in 4s. ckActivates=%d. Audio never started.",
+               log: SixPagesVoicePlugin.log, type: .error, self.callKitActivateCount)
+        self.stopUnit()
+        self.resolveStart(false)
+      }
+      startTimeoutWork = timeout
+      DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: timeout)
+
       do {
         try startUnit()
-        os_log("start: unit running (render + input installed)",
+        os_log("start: session configured + call requested — Dart is WAITING for didActivate",
                log: SixPagesVoicePlugin.log, type: .info)
-        result(true)
       } catch {
         os_log("start: FAILED — %{public}@", log: SixPagesVoicePlugin.log, type: .error,
                String(describing: error))
         stopUnit()
-        result(false)
+        resolveStart(false)
       }
     case "stop":
       stopUnit()
@@ -1874,15 +1953,24 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   /// Idempotent: didActivate can fire more than once (route changes, interruption
   /// recovery). The isRunning guard is what makes a second call harmless.
   private func beginAudio() {
-    if isRunning { return }
+    if isRunning {
+      // didActivate can fire again (route change, interruption recovery). Harmless — but
+      // if Dart is somehow still waiting, release it rather than leaving it hung.
+      resolveStart(true)
+      return
+    }
     do {
       try buildAndStartUnit()
       os_log("beginAudio: VPIO unit running at CALL priority",
              log: SixPagesVoicePlugin.log, type: .info)
+      // BUILD 19b: NOW, and only now, is the engine actually running. THIS is the moment
+      // Dart's `await _voice.start()` was always waiting for. Honor the old contract.
+      resolveStart(true)
     } catch {
       os_log("beginAudio: FAILED -- %{public}@", log: SixPagesVoicePlugin.log, type: .error,
              String(describing: error))
       endAudio()
+      resolveStart(false)
     }
   }
 
@@ -2137,6 +2225,11 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   }
 
   private func tearDownUnit() {
+    // BUILD 19b: never leave a Dart future hanging. If teardown happens while a start is
+    // still in flight (stop tapped fast, CallKit refused the call, provider reset), the
+    // held FlutterResult must be answered or the Dart side waits forever.
+    resolveStart(false)
+
     stopDrain()
     if let unit = ioUnit {
       AudioOutputUnitStop(unit)
