@@ -8,7 +8,89 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// BUILD 17: ANSWER THE CALL. setPreferredInput — THE API WE NEVER CALLED.
+// BUILD 18: DIAGNOSTIC ONLY. IS THE MIC ACTUALLY RUNNING? WE HAVE NEVER LOOKED.
+//
+// NO BEHAVIOR CHANGE. NOT A FIX. Three counters. Read why before touching anything.
+//
+// BUILD 17 WORKED. Measured in the car -- the best data this project has ever produced:
+//     input=bt-hfp; prefIn=ok; routeAtStart=bt-hfp; route=bt-hfp; routeChanges=1;
+//     spkDefault=off; policyApplies=0; policyFails=0; droppedBytes=0;
+//     interruptions=0; why=[categoryChange>bt-hfp]   <- NO override>speaker. NONE.
+//
+// setPreferredInput LANDED, first try. The car's HFP mic was selected. iOS moved the
+// output to the matching HFP port exactly as Apple documented. The route was bt-hfp at
+// start, bt-hfp at the end, and NEVER MOVED IN BETWEEN. Never interrupted. Never dropped
+// a single byte.
+//
+// AND THE CAR STILL HUNG UP AT FIVE SECONDS.
+//
+// THAT KILLS EVERY ROUTING THEORY. Builds 14, 15, 16 and 17 were all, in the end, about
+// WHO IS MOVING THE OUTPUT ROUTE. The answer is NOBODY. Not iOS, not us. The route is
+// correct and stable from the first millisecond to the last, and the drop happens anyway.
+// override>speaker -- the symptom we chased for four builds -- IS GONE, AND THE BUG IS
+// NOT. It was never the cause. It was iOS calmly falling back to the built-in speaker
+// AFTER the car had already hung up. Four builds spent chasing an echo.
+//
+// SO WHAT IS LEFT? THE UPLINK.
+//
+// HFP is a bidirectional CALL. The car opened the SCO channel and waits for microphone
+// audio to flow UP it. A hands-free unit that receives no uplink frames ENDS THE CALL.
+// That is not a bug in the car -- it is what a hands-free unit is SUPPOSED to do with a
+// dead call. Five seconds is a textbook watchdog.
+//
+// AND HERE IS THE HOLE WE HAVE NEVER LOOKED INTO:
+//
+//     prefIn=ok proves we SELECTED the car's microphone.
+//     It proves NOTHING about whether VPIO ever DELIVERED A SINGLE FRAME FROM IT.
+//
+//     SELECTION IS NOT DELIVERY.
+//
+// The strip has had renderCalls -- the OUTPUT side -- for ten builds. It has NEVER had a
+// single counter on the CAPTURE side. Not one. VPIO's input bus could be handing us
+// nothing at all from that HFP mic (never firing, or firing and failing to render) and
+// EVERY NUMBER ON THE CURRENT STRIP WOULD LOOK EXACTLY AS IT DOES NOW. We could not tell.
+// We cannot tell right now.
+//
+// Same blindness as Build 13 (the route observer discarded the reason userInfo for WEEKS)
+// and Build 16 (routeName collapsed A2DP and HFP into one string, so that build could not
+// measure its own hypothesis). Every time: the answer was already in the system, and we
+// had no instrument pointed at it.
+//
+// THE THREE COUNTERS:
+//     captureCalls  -- did VPIO's input callback EVER FIRE? renderCalls' missing twin.
+//     captureBytes  -- did AudioUnitRender actually PRODUCE AUDIO, or empty frames?
+//     captureFails  -- did AudioUnitRender RETURN AN ERROR? The loudest one. That status
+//                      is currently returned up the stack and VANISHES -- no log, no
+//                      counter, nothing. If VPIO cannot render from the HFP input bus, it
+//                      has been failing SILENTLY, inside a real-time callback, on every
+//                      drive we have ever taken, and there was NO WAY TO KNOW.
+//
+// SPLITS THE REMAINING SPACE IN HALF, AND NOBODY HAS TO SPEAK A WORD IN THE CAR. (Amy
+// cannot: Joe starts immediately and the call dies at 5s. There is no time for a turn.
+// NO TEST MAY DEPEND ON HER TAKING ONE.)
+//
+//   CASE A -- captureCalls climbing, captureBytes climbing, captureFails=0:
+//       THE UPLINK IS ALIVE. Audio flows both ways and the car hangs up anyway. Starvation
+//       is NOT the reason. Go look at SCO link LIFETIME -- activation options, .voiceChat
+//       vs .videoChat, whether iOS holds SCO up at all. STOP LOOKING AT THE AUDIO PATH.
+//
+//   CASE B -- captureCalls=0, OR captureBytes frozen, OR captureFails>0, while renderCalls
+//             climbs into the hundreds:
+//       THE MIC WAS SELECTED BUT NEVER OPENED. Dead uplink. The car's watchdog kills the
+//       call at 5s exactly as designed. COMPLETE EXPLANATION, and it points straight at
+//       how we configure the input bus.
+//
+// EXPECTED ON A BARE DEVICE (desk): captureCalls AND captureBytes BOTH CLIMBING,
+// captureFails=0. The built-in mic demonstrably works -- this is the CONTROL. It proves
+// the counters are wired correctly BEFORE we trust them in a car. IF THE DESK SHOWS
+// captureCalls=0, THE INSTRUMENT IS BROKEN, NOT THE CAR. Check that first. Every time.
+//
+// ---- PRIOR ----------------------------------------------------------------
+//
+// BUILD 17: ANSWER THE CALL. setPreferredInput -- THE API WE NEVER CALLED. CORRECT, KEPT,
+// AND PROVEN IN THE CAR (prefIn=ok, input=bt-hfp, route=bt-hfp, no override anywhere). It
+// did not stop the drop, but it is the reason we can now SEE that routing was never the
+// problem. DO NOT REVERT IT.
 //
 // UNTESTED IN A CAR AS OF THIS COMMIT. Build 16's failure is what proved it necessary.
 //
@@ -712,6 +794,17 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   /// Build 17: did setPreferredInput take? ok | none | FAILED. Survives teardown so the
   /// strip can be read after the fact; reset only in startUnit().
   private var preferredInputState = "none"
+
+  /// BUILD 18: THE CAPTURE SIDE. Ten builds of OUTPUT instrumentation and ZERO on the mic.
+  /// Written from the audio thread (inputCallback), read from the platform thread (strip).
+  /// Same discipline as renderCalls/droppedBytes: plain counters, no locks, no allocation
+  /// inside the callback. A torn read is harmless -- we are looking for "zero versus
+  /// climbing," never an exact value. Reset ONLY in startUnit(), so a strip read after
+  /// teardown still reports what the session actually did.
+  private var captureCallCount = 0
+  private var captureByteCount = 0
+  private var captureFailCount = 0
+  private var lastCaptureStatus: OSStatus = 0
   private var routeHistory: [String] = []   // reason>route, capped; the whole story in one field
 
   /// Build 14: speaker-policy state. See applySpeakerPolicy().
@@ -869,6 +962,13 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         // BUILD 17: input= IS THE FIRST NUMBER TO READ IN A CAR. The car hangs up when
         // the HFP call has no upstream — i.e. when input=mic-builtin while a call is
         // open. input=bt-hfp means we answered it. prefIn= says whether the set took.
+        // BUILD 18: THE CAPTURE COUNTERS GO FIRST, AHEAD OF input=. In a car, "did the
+        // mic actually RUN" now outranks "which mic did we PICK" -- Build 17 already
+        // proved we pick the right one and the car hangs up on us anyway.
+        + "captureCalls=\(captureCallCount); captureBytes=\(captureByteCount); "
+        + "captureFails=\(captureFailCount)"
+        + (lastCaptureStatus != 0 ? " [status=\(lastCaptureStatus)]" : "")
+        + "; "
         + "input=\(currentInputName()); prefIn=\(preferredInputState); "
         + "routeAtStart=\(routeAtStart); route=\(liveRoute); "
         + "routeChanges=\(routeChangeCount); spkDefault=\(speakerDefaultOn ? "on" : "off"); "
@@ -1503,6 +1603,13 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     policyApplyCount = 0
     policyFailCount = 0
     preferredInputState = "none"
+    // BUILD 18: reset the capture counters HERE, in startUnit, beside every other
+    // per-session counter -- NEVER in stopUnit. Hard Rules #6: stopUnit clears state, so a
+    // post-teardown strip is meaningless. These must survive teardown by construction.
+    captureCallCount = 0
+    captureByteCount = 0
+    captureFailCount = 0
+    lastCaptureStatus = 0
 
     // ── BUILD 17: ANSWER THE CALL ─────────────────────────────────────────────
     // MUST be here — AFTER setActive(true). Apple: "To set the input, the app's session
@@ -1868,6 +1975,11 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     guard let unit = plugin.ioUnit, let scratch = plugin.captureScratch else { return noErr }
 
     let frames = Int(inNumberFrames)
+    // BUILD 18: the callback FIRED. Counted BEFORE the early-return below, so that
+    // "VPIO is calling us but the frames are unusable" stays distinguishable from
+    // "VPIO never called us at all." Different bugs, different fixes.
+    plugin.captureCallCount += 1
+
     plugin.lastInputFrames = frames
     if frames <= 0 || frames > plugin.captureScratchFrameCap { return noErr }
 
@@ -1891,6 +2003,20 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // A render error here is a real failure; report it (do NOT swallow it as
       // noErr — but also do NOT inherit AECAudioStream's inverse bug of
       // returning an error on SUCCESS. This branch is genuine failure only).
+      //
+      // BUILD 18: AND COUNT IT. Until now this status went up the stack and VANISHED --
+      // no log, no counter, nothing on the strip. If VPIO cannot render from the car's
+      // HFP input bus, it has been failing SILENTLY, inside a real-time audio callback,
+      // on every drive we have ever taken.
+      //
+      // captureFails > 0 in the car WITH renderCalls climbing = the mic was SELECTED but
+      // never OPENED. Dead uplink. The car's watchdog then hangs up at 5s exactly as it is
+      // designed to. That is the whole bug, and lastCaptureStatus names the OSStatus.
+      //
+      // NO os_log HERE. Real-time callback; logging can block the render deadline. The
+      // counters ARE the report. That is what they are for.
+      plugin.captureFailCount += 1
+      plugin.lastCaptureStatus = status
       return status
     }
 
@@ -1899,6 +2025,12 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     // the drain reassembles fixed 640-byte frames (July 7 risk 2: buffer-
     // agnostic drain, never assume a fixed callback frame size).
     plugin.capture.write(from: UnsafeRawPointer(scratch), count: byteCount)
+
+    // BUILD 18: bytes that ACTUALLY REACHED the capture ring. The substitution standard
+    // for the uplink: not "the callback ran" (captureCalls), not "it did not error"
+    // (captureFails), but REAL AUDIO ARRIVED. Prove the right thing appeared -- never
+    // merely the absence of the wrong thing.
+    plugin.captureByteCount += byteCount
 
     return noErr // July 7 risk 3: return noErr on success.
   }
