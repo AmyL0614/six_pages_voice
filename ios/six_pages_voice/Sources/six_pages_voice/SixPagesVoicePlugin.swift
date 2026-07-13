@@ -8,9 +8,99 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// BUILD 15: THE ORDERING WAS THE BUG. WE APPLIED THE POLICY AFTER ACTIVATION.
+// BUILD 16: WE ASKED THE CAR FOR A PHONE CALL AND THEN NEVER PICKED UP.
 //
-// UNTESTED IN A CAR AS OF THIS COMMIT. Build 14's diagnostic is what found it.
+// UNTESTED IN A CAR AS OF THIS COMMIT. Build 15's failure is what found it.
+//
+// WHAT THE USER ACTUALLY SEES (this is the observation that broke the case open,
+// and it was never written down until now):
+//     Tap Talk -> the CAR'S DASH SHOWS AN INCOMING PHONE CALL. Joe plays through
+//     the car speakers. At ~5 seconds THE CALL ENDS on the dash, and Joe continues,
+//     uninterrupted, out of the iPad speaker.
+//
+// The car is not rejecting us. The car HANGS UP ON US. `override>speaker` is the
+// AFTERMATH — iOS falling back to the built-in speaker once the call is gone. We
+// spent days fixing the fallback and never asked why the call ended.
+//
+// THE MECHANISM:
+//   .allowBluetooth requests HANDS-FREE PROFILE (HFP). HFP is a bidirectional
+//   PHONE CALL. The car opens a call channel and expects microphone audio to flow
+//   UP it, from the car's mic to us. We never send any: VPIO captures from the
+//   BUILT-IN iPad mic. The car's hands-free stack sits on an open call with a dead
+//   upstream, times out, and DISCONNECTS. Every time. At the same 5 seconds.
+//
+// Build 15 was CORRECT — it removed .defaultToSpeaker cleanly and PROVED it:
+// spkDefault=off, policyApplies=0, and the override fired ANYWAY. That result is
+// what falsified the entire "we are overriding ourselves" theory that Builds 14
+// and 15 were both built on. A correct fix to the wrong bug. Its diagnostic value
+// was the whole point.
+//
+// THE FIX — APPLE'S DOCUMENTED CONTRACT, VERBATIM FROM THE CURRENT SDK HEADER:
+//
+//     "AVAudioSessionCategoryPlayAndRecord: AllowBluetoothA2DP defaults to false,
+//      but can be set to true, allowing a paired Bluetooth A2DP device to appear as
+//      an available route for OUTPUT, WHILE RECORDING THROUGH THE CATEGORY-
+//      APPROPRIATE INPUT."
+//
+// That is EXACTLY our use case, in Apple's own words: A2DP out, built-in mic in,
+// under .playAndRecord. It is not a workaround. It is the supported configuration.
+//
+// And the priority rule that explains everything that came before:
+//
+//     "In cases where a single Bluetooth device supports both HFP and A2DP, the HFP
+//      ports will be given HIGHER PRIORITY for routing."
+//
+// So: A2DP OUT (.allowBluetoothA2DP), HFP GONE (.allowBluetooth REMOVED). With no
+// HFP there is NO CALL TO HANG UP. No dash phone icon. Nothing to time out. The car
+// takes Joe as MEDIA — which is what he is — over the stereo A2DP link.
+//
+// STILL A REMOVAL, and the cleanest one yet: we are DELETING the request for a phone
+// call we never intended to make.
+//
+// ── THE A2DP RECORD, CORRECTED. READ THIS BEFORE "PUTTING IT BACK." ──────────
+//
+// Build 10 deleted .allowBluetoothA2DP and the handoff credits that with fixing the
+// "tin-can" sound. By Apple's OWN priority rule above, that attribution CANNOT be
+// right: the category still contained .allowBluetooth afterward, so HFP still won,
+// so the profile did not change. The tin-can sound WAS HFP — 8 kHz mono narrowband —
+// and it was HFP both before and after that deletion.
+//
+// A2DP was ALSO blamed for the chopped/dropped Joe audio. It was not that either.
+// The chop was a RING-BUFFER OVERFLOW, proven by arithmetic, in OUR OWN code:
+//     ring 960,000 B + droppedBytes 645,178 B = 1,605,178 B = 50.2 s = ONE JOE TURN.
+// Build 11 grew the ring to 180 s and droppedBytes went to ZERO. A2DP is DOWNSTREAM
+// of the ring — it transports audio the render callback has ALREADY drained. It
+// cannot reach back up the pipe and delete bytes. There is no mechanism. The two
+// were never connected; they were correlated on one night when several things changed.
+//
+// THE HONEST POINT: we have NEVER ONCE TESTED A2DP AS THE ACTIVE PROFILE. Every
+// prior run had .allowBluetooth in the category, so HFP always won on priority.
+// Every conclusion drawn about "A2DP failing" was drawn from runs where A2DP WAS
+// NEVER THE ROUTE. This build tests it for the first time.
+//
+// RISKS, NAMED (both visible in ONE drive, on the strip):
+//   1. iOS may force HFP anyway when an input is active, ignoring the option. If so,
+//      the dash call icon RETURNS and we are back where we started. Measurable.
+//   2. droppedBytes is on the same strip. If A2DP somehow correlates with the chop —
+//      it should not, per the arithmetic above — we will SEE it, not guess at it.
+//
+// EXPECTED IN THE CAR:
+//     NO phone-call icon on the dash. NO call to end.
+//     routeAtStart=bluetooth; route=bluetooth; spkDefault=off; policyApplies=0;
+//     droppedBytes=0; NO override>speaker; and the conversation SURVIVES PAST 5s.
+//     Joe should also sound BETTER than he ever has in the car — stereo A2DP
+//     instead of an 8 kHz call channel.
+//
+// EXPECTED ON A BARE DEVICE (desk): unchanged from Build 15.
+//     route=speaker; spkDefault=on; policyApplies=0.
+//
+// ── PRIOR ──────────────────────────────────────────────────────────────────
+//
+// BUILD 15: decided .defaultToSpeaker BEFORE setActive(true) and probed via
+// availableInputs so the output override could not corrupt the answer. Both changes
+// are CORRECT and are KEPT. It proved .defaultToSpeaker was NOT the override source
+// (spkDefault=off + policyApplies=0 + override fired anyway) — which is precisely
+// what pointed at HFP. Superseded only in its diagnosis, not in its code.
 //
 // MEASURED (iPad, in a car, Build 14):
 //     routeAtStart=bluetooth; route=speaker; routeChanges=2;
@@ -820,6 +910,28 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     .lineIn
   ]
 
+  /// BUILD 16 — WHY THE INPUT PROBE IS NO LONGER SUFFICIENT ON ITS OWN.
+  ///
+  /// Build 15 leaned on availableInputs because currentRoute.outputs was being
+  /// corrupted by our own .defaultToSpeaker override. That reasoning was sound and
+  /// the probe STAYS. But it was built for a world where we requested HFP — and an
+  /// HFP car exposes a bluetoothHFP INPUT port, which is what made the probe work.
+  ///
+  /// We no longer request HFP. An A2DP car is OUTPUT-ONLY BY DEFINITION: it exposes
+  /// a bluetoothA2DP output port and NO input port at all. So on the very device
+  /// this build exists to fix, availableInputs now returns NOTHING useful.
+  ///
+  /// The output probe carries it instead — and it is now TRUSTWORTHY, because Build
+  /// 15 already removed the override that was poisoning it. .defaultToSpeaker is
+  /// decided BEFORE setActive and never re-applied behind our back. Nothing steals
+  /// currentRoute.outputs anymore.
+  ///
+  /// Keep BOTH. Either one being true means "not alone." Neither alone is enough:
+  ///   - A2DP car / A2DP headphones  -> OUTPUT port only, no input.
+  ///   - Wired headset with a mic     -> input port, and an output port.
+  ///   - Wired headphones (no mic)    -> OUTPUT port only, no input.
+  /// The union is the honest answer. This is a widening, not a replacement.
+
   private func hasExternalOutput() -> Bool {
     let session = AVAudioSession.sharedInstance()
 
@@ -861,7 +973,11 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       return
     }
 
-    var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
+    // BUILD 16: A2DP OUT, NO HFP. Must match startUnit() EXACTLY — if these two
+    // sites ever disagree, a mid-session route change silently re-negotiates the
+    // Bluetooth profile underneath a live VPIO unit and the car hangs up again.
+    // See the header: .allowBluetooth requests a PHONE CALL we never answer.
+    var options: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
     if wanted { options.insert(.defaultToSpeaker) }
 
     do {
@@ -1123,7 +1239,22 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // .defaultToSpeaker, exactly as before. A bare iPhone still cannot reach the earpiece.
       let externalAtStart = hasExternalOutput()
 
-      var startOptions: AVAudioSession.CategoryOptions = [.allowBluetooth]
+      // BUILD 16: .allowBluetoothA2DP, and NOT .allowBluetooth. This is the whole fix.
+      //
+      // .allowBluetooth  = HFP = a bidirectional PHONE CALL. The car opens a call
+      //                    channel, waits for mic audio we never send (VPIO captures
+      //                    from the BUILT-IN mic), times out, and HANGS UP at ~5s.
+      // .allowBluetoothA2DP = stereo MEDIA output. No call. Nothing to hang up.
+      //
+      // Apple, current SDK header, .playAndRecord: A2DP "appear[s] as an available
+      // route for output, WHILE RECORDING THROUGH THE CATEGORY-APPROPRIATE INPUT."
+      // Output to the car, input from the built-in mic. Exactly what we need, and
+      // exactly what VPIO's AEC needs. Documented, supported, not a workaround.
+      //
+      // DO NOT ADD .allowBluetooth BACK "for symmetry" or "for headsets." Apple:
+      // when one device offers both, HFP WINS PRIORITY — so adding it back silently
+      // reinstates the phone call and the 5-second hang-up returns.
+      var startOptions: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
       if !externalAtStart { startOptions.insert(.defaultToSpeaker) }
 
       try session.setCategory(.playAndRecord, mode: .voiceChat, options: startOptions)
