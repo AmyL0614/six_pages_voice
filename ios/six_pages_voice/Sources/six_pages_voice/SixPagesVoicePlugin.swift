@@ -8,9 +8,115 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
-// BUILD 16: WE ASKED THE CAR FOR A PHONE CALL AND THEN NEVER PICKED UP.
+// BUILD 17: ANSWER THE CALL. setPreferredInput — THE API WE NEVER CALLED.
 //
-// UNTESTED IN A CAR AS OF THIS COMMIT. Build 15's failure is what found it.
+// UNTESTED IN A CAR AS OF THIS COMMIT. Build 16's failure is what proved it necessary.
+//
+// ── WHAT BUILD 16 PROVED (a failure worth its build) ────────────────────────
+//
+// Build 16 removed .allowBluetooth and set ONLY .allowBluetoothA2DP, on the strength of
+// Apple's SDK header: ".playAndRecord: AllowBluetoothA2DP ... allow[s] a paired Bluetooth
+// A2DP device to appear as an available route for output, WHILE RECORDING THROUGH THE
+// CATEGORY-APPROPRIATE INPUT."
+//
+// MEASURED: the dash showed the phone call ANYWAY, and it hung up at 5s ANYWAY.
+//
+// iOS FORCED HFP regardless of the option. The header and the runtime disagree, and the
+// runtime wins. When an input is ACTIVE on .playAndRecord, Bluetooth MUST be HFP — A2DP
+// is output-only and cannot carry duplex audio, so it is disallowed while recording.
+//
+// So WE CANNOT REFUSE THE CALL. Which means WE MUST ANSWER IT.
+//
+// ── THE DIAGNOSIS STANDS. THE FIX INVERTS. ─────────────────────────────────
+//
+// The car hangs up because the HFP call has a DEAD UPSTREAM. HFP is a bidirectional
+// PHONE CALL: the car opens a call channel and expects microphone audio to flow UP it.
+// We never sent any — VPIO captured from the BUILT-IN iPad mic while the car's call
+// channel sat empty. The car's hands-free stack timed out and DISCONNECTED. Every time.
+// Same 5 seconds. `override>speaker` was always the AFTERMATH: iOS falling back to the
+// built-in speaker once the call died.
+//
+// Build 16 tried to decline the call. iOS would not let us. Build 17 PICKS UP.
+//
+// ── APPLE'S CONTRACT, FROM AN APPLE ENGINEER, VERBATIM ─────────────────────
+//
+//     "If an application is using setPreferredInput to select a Bluetooth HFP input,
+//      THE OUTPUT SHOULD AUTOMATICALLY BE CHANGED TO THE BLUETOOTH HFP OUTPUT
+//      CORRESPONDING WITH THAT INPUT."
+//
+// That is the entire mechanism in one sentence. SELECT THE MICROPHONE, AND THE ROUTE
+// FOLLOWS. We never touch the output. We call no override. We select no output port.
+// We pick the INPUT — and iOS moves the output to the matching HFP port itself.
+//
+// This is the SAME IDEA as Android's setCommunicationDevice, which we DO call, which is
+// why ANDROID HAS ALWAYS WORKED and iOS never has. We built one half of the pair and
+// not the other. The platforms have different APIs for the same contract; we honored
+// Android's and never found iOS's.
+//
+// AND THE ORDERING, ALSO FROM APPLE: "To set the input, the app's session needs to be in
+// CONTROL OF ROUTING." setPreferredInput MUST be called AFTER setActive(true). Called
+// before activation it is a silent no-op — that is the failure mode in the Apple forum
+// thread where the route "clearly has not changed."
+//
+// ── THIS IS NOT A ROUTE OVERRIDE. DO NOT CONFUSE IT WITH ONE. ──────────────
+//
+// Every route lever we ever DELETED was an OUTPUT lever: overrideOutputAudioPort
+// (c95f26c) and .defaultToSpeaker-at-activation (Build 15). Deleting those was RIGHT
+// and they stay deleted. setPreferredInput is an INPUT API — Apple's documented,
+// sanctioned way for a .playAndRecord session to choose its microphone. Choosing the
+// mic is OUR job. Choosing the output route is iOS's job, and we still do not touch it.
+//
+// ── WHAT THIS MEANS IN PRACTICE ────────────────────────────────────────────
+//
+//   - The car's MICROPHONE becomes the input. Joe hears you through the car mic, not
+//     the iPad's. In a car this is BETTER: the car mic is aimed at the driver; the iPad
+//     is on a seat somewhere. This is what CarPlay does. This is what every hands-free
+//     voice app does. It is the correct trade, not a compromise.
+//   - Automotive HFP mics are 8 kHz. VPIO resamples internally (Build 4 deleted the
+//     AVAudioConverter for exactly this reason), so we still receive 16 kHz frames.
+//     Joe HEARS a telephone-grade mic — same as every hands-free system on earth, and
+//     what ElevenLabs' STT is built for.
+//   - .allowBluetooth is RESTORED, and .allowBluetoothA2DP is KEPT alongside it. Apple:
+//     when one device offers both, HFP WINS PRIORITY — which is now EXACTLY what we
+//     want. HFP for the car; A2DP still available for an output-only music device.
+//   - VPIO's AEC still owns both ends (car mic in, car speaker out). This is the
+//     configuration VoiceProcessingIO was DESIGNED for. OPEN QUESTION, stated honestly:
+//     AEC quality through a car's HFP loop is unproven for us. If Joe echoes, that is
+//     the thing to look at — NOT the routing, which this build is about.
+//
+// ── DIAGNOSTIC FIX (Build 16 was UNREADABLE and that is on the strip's author) ──
+//
+// routeName() collapsed .bluetoothA2DP AND .bluetoothHFP into the single string
+// "bluetooth" — to match Android's log names. So the ONE FACT Build 16 existed to test
+// (which profile did we actually get?) was THE ONE FACT THE STRIP COULD NOT REPORT.
+// Same class of error as Build 13's discarded userInfo: a diagnostic that cannot
+// distinguish the thing it measures. Now: "bt-hfp" vs "bt-a2dp". Never merge them again.
+//
+// NEW STRIP FIELDS: input=, prefIn=, and route= now names the PROFILE.
+//   input=      what MIC we actually ended up on (the whole ballgame)
+//   prefIn=     ok | none | FAILED — did setPreferredInput take?
+//
+// EXPECTED IN THE CAR:
+//     input=bt-hfp; prefIn=ok; route=bt-hfp (or car-audio); spkDefault=off;
+//     policyApplies=0; droppedBytes=0; NO override>speaker;
+//     THE CALL STAYS UP ON THE DASH AND THE CONVERSATION SURVIVES PAST 5 SECONDS.
+//
+//     input=mic-builtin WITH the call on the dash = setPreferredInput did not take, and
+//     we are back to a dead upstream. That is the failure signature. Read input= FIRST.
+//
+// EXPECTED ON A BARE DEVICE (desk): unchanged.
+//     input=mic-builtin; prefIn=none; route=speaker; spkDefault=on; policyApplies=0.
+//
+// ── PRIOR ──────────────────────────────────────────────────────────────────
+//
+// BUILD 16: removed .allowBluetooth, A2DP only. iOS forced HFP anyway — the call still
+// appeared and still hung up. It PROVED A2DP-output-while-recording does not hold under
+// a live input, which is what forced the correct fix. Superseded.
+//
+// BUILD 15: decided .defaultToSpeaker BEFORE setActive(true); probed via availableInputs.
+// Both changes CORRECT and KEPT. Proved .defaultToSpeaker was NOT the override source
+// (spkDefault=off + policyApplies=0 + override fired anyway) — which is what pointed at
+// HFP in the first place. Superseded in diagnosis, not in code.
 //
 // WHAT THE USER ACTUALLY SEES (this is the observation that broke the case open,
 // and it was never written down until now):
@@ -603,6 +709,9 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   /// car problem and it has never once been readable, because it only ever went to os_log.
   private var routeChangeCount = 0
   private var routeAtStart = "?"
+  /// Build 17: did setPreferredInput take? ok | none | FAILED. Survives teardown so the
+  /// strip can be read after the fact; reset only in startUnit().
+  private var preferredInputState = "none"
   private var routeHistory: [String] = []   // reason>route, capped; the whole story in one field
 
   /// Build 14: speaker-policy state. See applySpeakerPolicy().
@@ -757,6 +866,10 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         + "primed=\(primed); reprimes=\(reprimeEvents); primeThresh=\(primeThresholdBytes)B; "
         + "droppedBytes=\(playback.droppedBytes); maxRenderUs=\(maxRenderMicros); "
         + "interruptions=\(interruptionCount); resumeFails=\(interruptionResumeFailures); "
+        // BUILD 17: input= IS THE FIRST NUMBER TO READ IN A CAR. The car hangs up when
+        // the HFP call has no upstream — i.e. when input=mic-builtin while a call is
+        // open. input=bt-hfp means we answered it. prefIn= says whether the set took.
+        + "input=\(currentInputName()); prefIn=\(preferredInputState); "
         + "routeAtStart=\(routeAtStart); route=\(liveRoute); "
         + "routeChanges=\(routeChangeCount); spkDefault=\(speakerDefaultOn ? "on" : "off"); "
         + "policyApplies=\(policyApplyCount); policyFails=\(policyFailCount); "
@@ -973,11 +1086,14 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       return
     }
 
-    // BUILD 16: A2DP OUT, NO HFP. Must match startUnit() EXACTLY — if these two
-    // sites ever disagree, a mid-session route change silently re-negotiates the
-    // Bluetooth profile underneath a live VPIO unit and the car hangs up again.
-    // See the header: .allowBluetooth requests a PHONE CALL we never answer.
-    var options: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
+    // BUILD 17: .allowBluetooth RESTORED alongside .allowBluetoothA2DP. Must match
+    // startUnit() EXACTLY — if these two sites disagree, a mid-session route change
+    // silently re-negotiates the Bluetooth profile under a live VPIO unit.
+    //
+    // Apple: when ONE device offers both HFP and A2DP, HFP WINS PRIORITY. That is now
+    // exactly what we want — we ANSWER the call (see selectPreferredInput) instead of
+    // refusing it. A2DP stays in the set for output-only devices that have no HFP.
+    var options: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
     if wanted { options.insert(.defaultToSpeaker) }
 
     do {
@@ -1202,17 +1318,122 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     os_log("%{public}@ -> %{public}@", log: SixPagesVoicePlugin.log, type: .info, prefix, name)
   }
 
-  /// Names match Android's routeName() so both platforms read identically in logs.
+  /// BUILD 17: HFP AND A2DP ARE NO LONGER THE SAME WORD.
+  ///
+  /// This function used to map BOTH .bluetoothA2DP and .bluetoothHFP to "bluetooth" so
+  /// the logs would read identically to Android's. That cosmetic symmetry made Build 16
+  /// UNREADABLE: Build 16 existed to answer "which Bluetooth profile did iOS actually
+  /// give us?" and the strip was structurally incapable of saying. We had to look at the
+  /// CAR'S DASHBOARD to learn what our own diagnostic should have told us.
+  ///
+  /// Same class of error as Build 13's discarded userInfo: an instrument that cannot
+  /// distinguish the thing it is pointed at. HFP vs A2DP is now THE central distinction
+  /// in this entire bug. NEVER MERGE THEM AGAIN, for any amount of log symmetry.
   private func routeName(_ port: AVAudioSession.Port) -> String {
     switch port {
-    case .bluetoothA2DP, .bluetoothHFP: return "bluetooth"
-    case .bluetoothLE:                  return "bluetooth-le"
-    case .headphones, .headsetMic:      return "wired-headphones"
-    case .usbAudio:                     return "usb-headset"
+    case .bluetoothHFP:                 return "bt-hfp"      // the CALL profile — duplex
+    case .bluetoothA2DP:                return "bt-a2dp"     // the MEDIA profile — out only
+    case .bluetoothLE:                  return "bt-le"
+    case .headphones:                   return "wired-headphones"
+    case .headsetMic:                   return "wired-headset-mic"
+    case .usbAudio:                     return "usb-audio"
     case .carAudio:                     return "car-audio"
     case .builtInSpeaker:               return "speaker"
     case .builtInReceiver:              return "earpiece"
+    case .builtInMic:                   return "mic-builtin"
     default:                            return port.rawValue
+    }
+  }
+
+  /// BUILD 17: THE MOST IMPORTANT LINE ON THE STRIP.
+  ///
+  /// Which MICROPHONE are we actually on? The car hangs up when the HFP call has no
+  /// upstream audio — i.e. when the input is the BUILT-IN mic while an HFP call is open.
+  /// So `input=` is the direct read of whether this build's fix took hold.
+  ///
+  ///     input=bt-hfp     -> we answered the call. The upstream is live.
+  ///     input=mic-builtin WITH a call on the dash -> DEAD UPSTREAM. The bug is back.
+  private func currentInputName() -> String {
+    let inputs = AVAudioSession.sharedInstance().currentRoute.inputs
+    return inputs.first.map { routeName($0.portType) } ?? "none"
+  }
+
+  /// BUILD 17: SELECT THE CAR'S MICROPHONE. THE OUTPUT FOLLOWS ON ITS OWN.
+  ///
+  /// Apple, verbatim: "If an application is using setPreferredInput to select a Bluetooth
+  /// HFP input, the output should automatically be changed to the Bluetooth HFP output
+  /// corresponding with that input."
+  ///
+  /// So this function NEVER touches the output. It picks a MIC. iOS does the rest. That
+  /// is the contract, and it is the entire reason this is not a route override: every
+  /// output lever we ever deleted (overrideOutputAudioPort, .defaultToSpeaker at
+  /// activation) STAYS deleted. Input selection is the app's job. Output routing is iOS's.
+  ///
+  /// MUST BE CALLED AFTER setActive(true). Apple: "To set the input, the app's session
+  /// needs to be in control of routing." Before activation this is a SILENT NO-OP — the
+  /// call succeeds, returns no error, and changes nothing. That is the trap in the Apple
+  /// forum thread where the route "clearly has not changed."
+  ///
+  /// FAILURE IS NON-FATAL. If there is no HFP input, or the set throws, we log it, count
+  /// it, and leave the session exactly as it was. A car that will not route is annoying.
+  /// A conversation that dies is unacceptable. Joe keeps talking no matter what.
+  ///
+  /// Preference order matters: .carAudio FIRST (a true car head unit, if the system
+  /// enumerates it as one), then .bluetoothHFP (what our test car actually reports),
+  /// then a wired headset mic. We do NOT select .builtInMic — that is already the
+  /// default, and selecting it explicitly is what KILLS the HFP upstream.
+  private static let preferredInputPorts: [AVAudioSession.Port] = [
+    .carAudio,
+    .bluetoothHFP,
+    .headsetMic,
+    .usbAudio
+  ]
+
+  private func selectPreferredInput() {
+    let session = AVAudioSession.sharedInstance()
+
+    guard let inputs = session.availableInputs, !inputs.isEmpty else {
+      preferredInputState = "none"
+      os_log("Preferred input: availableInputs EMPTY — nothing to select",
+             log: SixPagesVoicePlugin.log, type: .info)
+      return
+    }
+
+    // Log what the system is actually offering. When a car enumerates as some port type
+    // we did not anticipate, THIS LINE is the only way we will ever find out.
+    for port in inputs {
+      os_log("Preferred input: OFFERED %{public}@ (%{public}@)",
+             log: SixPagesVoicePlugin.log, type: .info,
+             routeName(port.portType), port.portName)
+    }
+
+    var chosen: AVAudioSessionPortDescription? = nil
+    outer: for wanted in SixPagesVoicePlugin.preferredInputPorts {
+      for port in inputs where port.portType == wanted {
+        chosen = port
+        break outer
+      }
+    }
+
+    guard let target = chosen else {
+      // No external mic on offer. The built-in mic is already the default; leave it.
+      preferredInputState = "none"
+      os_log("Preferred input: no external mic offered — leaving built-in default",
+             log: SixPagesVoicePlugin.log, type: .info)
+      return
+    }
+
+    do {
+      try session.setPreferredInput(target)
+      preferredInputState = "ok"
+      os_log("Preferred input: SELECTED %{public}@ (%{public}@) — output should follow",
+             log: SixPagesVoicePlugin.log, type: .info,
+             routeName(target.portType), target.portName)
+    } catch {
+      preferredInputState = "FAILED"
+      os_log("Preferred input: setPreferredInput THREW — %{public}@ (non-fatal, session left as-is)",
+             log: SixPagesVoicePlugin.log, type: .error,
+             error.localizedDescription)
     }
   }
 
@@ -1239,22 +1460,15 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // .defaultToSpeaker, exactly as before. A bare iPhone still cannot reach the earpiece.
       let externalAtStart = hasExternalOutput()
 
-      // BUILD 16: .allowBluetoothA2DP, and NOT .allowBluetooth. This is the whole fix.
+      // BUILD 17: .allowBluetooth IS BACK. Build 16 tried to remove it and iOS forced
+      // HFP anyway (the dash showed the call, and it still hung up at 5s). A2DP cannot
+      // carry duplex audio, so with a LIVE INPUT on .playAndRecord, Bluetooth MUST be
+      // HFP. We cannot refuse the call. So we ANSWER it — see selectPreferredInput()
+      // below, which picks the car's MIC and lets iOS move the output to match.
       //
-      // .allowBluetooth  = HFP = a bidirectional PHONE CALL. The car opens a call
-      //                    channel, waits for mic audio we never send (VPIO captures
-      //                    from the BUILT-IN mic), times out, and HANGS UP at ~5s.
-      // .allowBluetoothA2DP = stereo MEDIA output. No call. Nothing to hang up.
-      //
-      // Apple, current SDK header, .playAndRecord: A2DP "appear[s] as an available
-      // route for output, WHILE RECORDING THROUGH THE CATEGORY-APPROPRIATE INPUT."
-      // Output to the car, input from the built-in mic. Exactly what we need, and
-      // exactly what VPIO's AEC needs. Documented, supported, not a workaround.
-      //
-      // DO NOT ADD .allowBluetooth BACK "for symmetry" or "for headsets." Apple:
-      // when one device offers both, HFP WINS PRIORITY — so adding it back silently
-      // reinstates the phone call and the 5-second hang-up returns.
-      var startOptions: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
+      // Both options set. Apple: HFP wins priority when one device offers both — which
+      // is what we now WANT. A2DP remains for output-only devices with no HFP at all.
+      var startOptions: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
       if !externalAtStart { startOptions.insert(.defaultToSpeaker) }
 
       try session.setCategory(.playAndRecord, mode: .voiceChat, options: startOptions)
@@ -1288,12 +1502,29 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     // `false` with `true`, the guard would lie, and the policy would no-op forever.
     policyApplyCount = 0
     policyFailCount = 0
+    preferredInputState = "none"
+
+    // ── BUILD 17: ANSWER THE CALL ─────────────────────────────────────────────
+    // MUST be here — AFTER setActive(true). Apple: "To set the input, the app's session
+    // needs to be in control of routing." Before activation this is a silent no-op.
+    //
+    // This selects the car's MICROPHONE. Per Apple, iOS then moves the OUTPUT to the
+    // matching HFP port on its own. We never touch the output. That is the whole fix:
+    // the HFP call finally has audio flowing UP it, so the car has no reason to hang up.
+    //
+    // Non-fatal by construction. If it fails, Joe still talks — out of the iPad.
+    selectPreferredInput()
+
     // Where did we BEGIN? route= on the strip is post-hoc and only says where we ENDED.
     // Without this, "route=speaker" cannot distinguish "never got the car" from
     // "got the car and lost it" — two different bugs.
+    // NOTE: read AFTER selectPreferredInput() so it reflects the route we asked for.
     let startOutputs = session.currentRoute.outputs
     routeAtStart = startOutputs.first.map { routeName($0.portType) } ?? "none"
     logCurrentRoute(prefix: "Route at start")
+    os_log("Input at start -> %{public}@ (prefIn=%{public}@)",
+           log: SixPagesVoicePlugin.log, type: .info,
+           currentInputName(), preferredInputState)
 
     // BUILD 15: THE "start" POLICY CALL IS DELETED. DO NOT PUT IT BACK.
     //
