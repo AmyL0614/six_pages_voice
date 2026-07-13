@@ -2,11 +2,129 @@ import Flutter
 import UIKit
 import AVFoundation
 import AudioToolbox
+import CallKit   // BUILD 19: the missing declaration. See the header.
 import os.log
 import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-free ring
 
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
+//
+// BUILD 19: CALLKIT. NOBODY WAS HANGING UP -- NOBODY EVER PICKED UP.
+//
+// BUILD 18 CAME BACK CASE A, AND IT WAS DECISIVE:
+//     captureCalls=266; captureBytes=195776; captureFails=0
+//     renderCalls=266            <- IDENTICAL. Input fired on EVERY render cycle.
+//     input=bt-hfp; prefIn=ok; route=bt-hfp; routeChanges=1
+//     droppedBytes=0; interruptions=0; policyApplies=0; policyFails=0
+//
+// 195,776 bytes = 97,888 frames @ 16 kHz mono = 6.1 SECONDS of continuous audio pulled
+// from the CAR'S OWN MICROPHONE, with ZERO failures, right up to the moment the call died.
+//
+// THE ENTIRE AUDIO PATH IS EXONERATED. Both directions. Playback perfect, capture perfect,
+// routing perfect, no interruptions, no drops, no overrides. Every audio theory is dead.
+//
+// THE CAR HUNG UP ON A CALL THAT WAS WORKING.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// THE ANSWER WAS ON ANDROID THE WHOLE TIME
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Same car. Same app. Same ElevenLabs stream. Android opens a phone call on that dash and
+// the car HOLDS IT FOR AS LONG AS SHE WANTS TO TALK. iOS opens a phone call on that same
+// dash and the car says "Call ended" after five seconds.
+//
+// The car is not confused about what we are. It does the IDENTICAL thing on both platforms.
+// The difference is what each platform DECLARES.
+//
+// ANDROID (commit d6d95fa -- the fix that made Android hold the car):
+//     requestAudioFocus(USAGE_VOICE_COMMUNICATION, AUDIOFOCUS_GAIN)
+//     = "THIS IS A VOICE CALL." The Android telephony/BT stack then holds the SCO link
+//       up AS A CALL, and the car is satisfied.
+//
+// iOS (until this build):
+//     ...nothing. We set a category and opened a VPIO unit.
+//
+// So the Bluetooth stack negotiates HFP (we asked for it), the car opens a call channel
+// and puts "Call" on the dash -- but iOS's TELEPHONY layer says NO CALL IS IN PROGRESS.
+// The car's HFP state machine waits for the call-status indicator a real phone sends
+// (+CIEV: call=1). It never comes. The car concludes the call it opened was never actually
+// established, and tears down the orphaned SCO link. Five seconds is the HFP spec's
+// answer to exactly that. The dash even says it in plain words: CALL ENDED.
+//
+// NOBODY WAS HANGING UP ON US. NOBODY EVER PICKED UP.
+//
+// WE HAVE NOW MADE THIS EXACT MISTAKE TWICE:
+//     Android setCommunicationDevice()  <->  iOS setPreferredInput()   -- fixed in Build 17
+//     Android requestAudioFocus()       <->  iOS CallKit               -- THIS BUILD
+// Both times we built Android's half of the contract and shipped iOS without its half.
+// Then spent days deleting output-side code hunting for the missing half. Read Rule 5.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// THE CONTRACT -- APPLE, WWDC 2016 SESSION 230, VERBATIM
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//     "When using CallKit, you will NO LONGER ACTIVATE your app's audio session directly.
+//      Instead you will only CONFIGURE the audio session and THE SYSTEM WILL ACTUALLY
+//      ACTIVATE your app's audio session for you AT AN ELEVATED PRIORITY... our audio
+//      session will be activated by the system and after that happens, we'll receive a
+//      delegate callback called provider(didActivate:). AND THIS IS THE POINT WHERE WE
+//      BEGIN PROCESSING OUR CALL'S AUDIO."
+//
+// ELEVATED PRIORITY is not a footnote. It is WHY the system holds the SCO link up for a
+// CALL instead of treating us as a media app that happens to want a microphone.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// WHAT CHANGED STRUCTURALLY -- READ THIS BEFORE EDITING startUnit()
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// startUnit() is SPLIT IN TWO, and the seam is owned by iOS, not by us:
+//
+//   PHASE 1 -- startUnit()  [Flutter calls "start"]
+//       * configureSession()  : setCategory + mode + preferred rate. NOTHING ELSE.
+//                               *** DO NOT CALL setActive(true). THAT IS NOW THE OS'S JOB. ***
+//       * requestStartCall()  : CXCallController -> CXStartCallAction. THIS is the
+//                               declaration we never made. iOS now drives the HFP state
+//                               machine and tells the car a call is really in progress.
+//       * ...and then we STOP and WAIT. No VPIO unit yet. No audio yet.
+//
+//   PHASE 2 -- provider(_:didActivate:)  [iOS calls US, at elevated priority]
+//       * beginAudio() : NOW build the VPIO unit, NOW selectPreferredInput(), NOW start.
+//                        Everything that used to live after setActive(true) moved here.
+//
+// isRunning does NOT become true until Phase 2 completes. Flutter's start() returns as
+// soon as the call is REQUESTED -- audio follows a beat later, when iOS says go.
+//
+// TEARDOWN mirrors it: stopUnit() requests CXEndCallAction; audio stops in didDeactivate
+// (or immediately, if there is no call to end). endAudio() is idempotent -- BOTH paths
+// can reach it and it must survive being called twice.
+//
+// THE FIRST-LAUNCH TRAP, PRE-EMPTED: multiple Apple Forums threads report didActivate
+// sometimes NEVER FIRING on the very first call after launch. Apple's own engineer's
+// workaround is to configure the session BEFORE reporting the call, not inside the action
+// handler. We do exactly that -- configureSession() runs in startUnit(), ahead of the
+// CXStartCallAction -- so we are already on the right side of that bug. If didActivate
+// still fails to arrive, callKitDidActivate=0 on the strip says so out loud.
+//
+// PRIVACY: includesCallsInRecents = false. This app is for someone reaching for it at 3am
+// because they have nobody to call. Their reflection sessions do not belong in a call log.
+//
+// NEW STRIP FIELDS:
+//     callKit=      requested | active | ended | none   (the call's own lifecycle)
+//     ckActivates=  did provider(didActivate:) ever fire? 0 here means audio NEVER STARTED
+//                   and nothing else on the strip is meaningful.
+//
+// EXPECTED IN THE CAR:
+//     The dash call icon appears AND STAYS -- for as long as she wants to talk, exactly
+//     like Android. A system call UI appears on the iPad (that is CallKit; it is correct).
+//     callKit=active; ckActivates=1; input=bt-hfp; prefIn=ok; route=bt-hfp;
+//     captureCalls and renderCalls both climbing; droppedBytes=0; NO override>speaker.
+//     AND THE CONVERSATION SURVIVES PAST FIVE SECONDS.
+//
+// EXPECTED ON A BARE DEVICE (desk): unchanged behavior, plus callKit=active/ckActivates=1.
+// A call UI on the iPad with no car is EXPECTED and is not a bug. If ckActivates=0 on the
+// DESK, the CallKit seam itself is broken -- fix that before ever driving anywhere.
+//
+// ---- PRIOR ----------------------------------------------------------------
 //
 // BUILD 18: DIAGNOSTIC ONLY. IS THE MIC ACTUALLY RUNNING? WE HAVE NEVER LOOKED.
 //
@@ -774,6 +892,101 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   private var ioUnit: AudioUnit?
   private var isRunning = false
 
+  // ══ BUILD 19: CALLKIT ═════════════════════════════════════════════════════
+  // The declaration we never made. Android says "this is a voice call" via
+  // requestAudioFocus(USAGE_VOICE_COMMUNICATION). iOS says it via CallKit. Without it,
+  // the car opens an HFP call, waits for a call-status indicator that never arrives, and
+  // tears down the orphaned SCO link after five seconds. See the header.
+  private var callProvider: CXProvider?
+  private var callController: CXCallController?
+  private var currentCallUUID: UUID?
+
+  /// Lifecycle of the CALL, not of the audio. Distinct from isRunning on purpose:
+  /// between "requested" and "active" the call exists and the audio does NOT.
+  private var callKitState = "none"        // none | requested | active | ended
+  private var callKitActivateCount = 0     // did provider(didActivate:) EVER fire?
+
+  /// Lazily built, held for the life of the plugin. CXProvider must not be recreated per
+  /// call -- Apple: "Only create one instance of CXProvider."
+  private func ensureCallKit() {
+    if callProvider == nil {
+      let config = CXProviderConfiguration()
+      config.supportsVideo = false
+      config.maximumCallGroups = 1
+      config.maximumCallsPerCallGroup = 1
+      config.supportedHandleTypes = [.generic]
+      // PRIVACY, DELIBERATE: this app exists for someone with nobody to call. Their
+      // reflection sessions do not belong in the iOS call log.
+      config.includesCallsInRecents = false
+
+      let provider = CXProvider(configuration: config)
+      provider.setDelegate(self, queue: nil)
+      callProvider = provider
+      os_log("CallKit: provider created (recents=off)",
+             log: SixPagesVoicePlugin.log, type: .info)
+    }
+    if callController == nil { callController = CXCallController() }
+  }
+
+  /// PHASE 1. Declare the call. iOS drives the HFP state machine from here and tells the
+  /// car a call is genuinely in progress -- which is the entire point of this build.
+  /// Audio does NOT start here. It starts in provider(_:didActivate:).
+  private func requestStartCall() {
+    ensureCallKit()
+    guard let controller = callController else { return }
+
+    let uuid = UUID()
+    currentCallUUID = uuid
+
+    // .generic, not .phoneNumber: there is no number here, and we are not pretending
+    // there is. The car only needs to know a CALL EXISTS.
+    let handle = CXHandle(type: .generic, value: "Claude")
+    let action = CXStartCallAction(call: uuid, handle: handle)
+    action.isVideo = false
+
+    let transaction = CXTransaction(action: action)
+    controller.request(transaction) { [weak self] error in
+      guard let self = self else { return }
+      if let error = error {
+        // The call was refused. Audio will never start, because didActivate will never
+        // fire. Fail LOUDLY rather than sitting in a silent dead state.
+        self.callKitState = "none"
+        self.currentCallUUID = nil
+        os_log("CallKit: CXStartCallAction FAILED -- %{public}@",
+               log: SixPagesVoicePlugin.log, type: .error, error.localizedDescription)
+        return
+      }
+      self.callKitState = "requested"
+      os_log("CallKit: call requested -- waiting for didActivate",
+             log: SixPagesVoicePlugin.log, type: .info)
+
+      // Tell the system the call CONNECTED. Without this the CallKit UI sits on
+      // "connecting..." forever and some head units never settle their HFP state.
+      if let provider = self.callProvider {
+        provider.reportOutgoingCall(with: uuid, startedConnectingAt: nil)
+        provider.reportOutgoingCall(with: uuid, connectedAt: nil)
+      }
+    }
+  }
+
+  /// Ends the call with the system. Safe to call when there is no call.
+  private func requestEndCall() {
+    guard let uuid = currentCallUUID, let controller = callController else {
+      callKitState = "none"
+      return
+    }
+    let action = CXEndCallAction(call: uuid)
+    let transaction = CXTransaction(action: action)
+    controller.request(transaction) { [weak self] error in
+      if let error = error {
+        os_log("CallKit: CXEndCallAction failed -- %{public}@",
+               log: SixPagesVoicePlugin.log, type: .error, error.localizedDescription)
+      }
+      self?.callKitState = "ended"
+    }
+    currentCallUUID = nil
+  }
+
   /// Live only for the duration of a session; removed in stopUnit().
   private var routeObserver: NSObjectProtocol?
 
@@ -962,6 +1175,10 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         // BUILD 17: input= IS THE FIRST NUMBER TO READ IN A CAR. The car hangs up when
         // the HFP call has no upstream — i.e. when input=mic-builtin while a call is
         // open. input=bt-hfp means we answered it. prefIn= says whether the set took.
+        // BUILD 19: CALLKIT GOES FIRST. It now GATES EVERYTHING. If ckActivates=0 then
+        // provider(didActivate:) never fired, the VPIO unit was never built, and NO OTHER
+        // NUMBER ON THIS STRIP MEANS ANYTHING. Read it before you read anything else.
+        + "callKit=\(callKitState); ckActivates=\(callKitActivateCount); "
         // BUILD 18: THE CAPTURE COUNTERS GO FIRST, AHEAD OF input=. In a car, "did the
         // mic actually RUN" now outranks "which mic did we PICK" -- Build 17 already
         // proved we pick the right one and the car hangs up on us anyway.
@@ -1385,7 +1602,15 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       }
 
       do {
-        try AVAudioSession.sharedInstance().setActive(true)
+        // ╔═══════════════════════════════════════════════════════════════════════╗
+        // ║ BUILD 19: setActive(true) REMOVED HERE TOO. Under CallKit the SYSTEM  ║
+        // ║ re-activates the session after an interruption and tells us via       ║
+        // ║ provider(_:didActivate:). Calling setActive ourselves here fights     ║
+        // ║ CallKit for ownership of the session and can drop us back to MEDIA    ║
+        // ║ priority -- which is precisely the state the car hangs up on.         ║
+        // ║                                                                       ║
+        // ║ We only restart the UNIT. The SESSION is not ours to activate.        ║
+        // ╚═══════════════════════════════════════════════════════════════════════╝
         if let unit = ioUnit {
           let status = AudioOutputUnitStart(unit)
           if status == noErr {
@@ -1537,9 +1762,39 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     }
   }
 
+  /// BUILD 19 -- PHASE 1. CONFIGURE AND DECLARE. DO NOT ACTIVATE. DO NOT START AUDIO.
+  ///
+  /// Apple, WWDC 2016 S230: "When using CallKit, you will NO LONGER ACTIVATE your app's
+  /// audio session directly. Instead you will only CONFIGURE the audio session and the
+  /// system will actually activate it FOR you, AT AN ELEVATED PRIORITY."
+  ///
+  /// That elevated priority is what holds the car's SCO link up as a CALL. It is the
+  /// whole reason this build exists. Taking setActive(true) back would undo it.
+  ///
+  /// Audio starts in provider(_:didActivate:) -> beginAudio(). Not here. Never here.
   private func startUnit() throws {
     if isRunning { return }
 
+    callKitActivateCount = 0
+    callKitState = "none"
+
+    // Session config FIRST, call SECOND. This ordering is Apple's own documented
+    // workaround for the known first-launch bug where didActivate never fires: configure
+    // the session BEFORE reporting the call, not inside the action handler.
+    try configureSession()
+
+    // THE DECLARATION. Everything else in this build is scaffolding around this line.
+    requestStartCall()
+
+    // And now we WAIT. iOS will call provider(_:didActivate:) when the session is live at
+    // call priority, and THAT is where the VPIO unit gets built. isRunning stays false
+    // until then -- there is genuinely no audio engine yet.
+    os_log("start: session configured, call requested -- awaiting didActivate",
+           log: SixPagesVoicePlugin.log, type: .info)
+  }
+
+  /// Category, mode, preferred rate. NOTHING ELSE. Explicitly NO setActive(true).
+  private func configureSession() throws {
     let session = AVAudioSession.sharedInstance()
     do {
       // BUILD 15: DECIDE .defaultToSpeaker BEFORE setActive(true). NOT AFTER.
@@ -1573,7 +1828,21 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
       try session.setCategory(.playAndRecord, mode: .voiceChat, options: startOptions)
       try session.setPreferredSampleRate(SixPagesVoicePlugin.targetSampleRate)
-      try session.setActive(true)
+
+      // ╔═══════════════════════════════════════════════════════════════════════╗
+      // ║ BUILD 19: setActive(true) IS GONE FROM HERE. THIS IS THE POINT OF THE ║
+      // ║ BUILD. DO NOT PUT IT BACK.                                            ║
+      // ║                                                                       ║
+      // ║ Apple, WWDC 2016 S230: "When using CallKit, you will no longer        ║
+      // ║ activate your app's audio session directly. Instead you will only     ║
+      // ║ CONFIGURE the audio session and the system will actually ACTIVATE it  ║
+      // ║ for you AT AN ELEVATED PRIORITY."                                     ║
+      // ║                                                                       ║
+      // ║ That elevated priority is what makes iOS hold the car's SCO link up   ║
+      // ║ as a CALL. Activating it ourselves gets us a media session that       ║
+      // ║ happens to want a microphone -- which is exactly what the car has     ║
+      // ║ been hanging up on for eighteen builds.                               ║
+      // ╚═══════════════════════════════════════════════════════════════════════╝
 
       // speakerDefaultOn MIRRORS the live category. It MUST equal what we just passed to
       // setCategory or the idempotence guard in applySpeakerPolicy() believes a lie — and
@@ -1581,13 +1850,43 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // Set here, inside the do-block, so it can never drift from the actual call above.
       speakerDefaultOn = !externalAtStart
 
-      os_log("Category at activation: defaultToSpeaker=%{public}@ (externalAtStart=%{public}@)",
+      os_log("Category configured: defaultToSpeaker=%{public}@ (externalAtStart=%{public}@)",
              log: SixPagesVoicePlugin.log, type: .info,
              externalAtStart ? "OFF" : "ON", externalAtStart ? "yes" : "no")
     } catch {
       throw AudioError.session(error.localizedDescription)
     }
+  }
 
+  /// BUILD 19 -- PHASE 2. THE SYSTEM SAID GO.
+  ///
+  /// Called from provider(_:didActivate:) ONLY. By the time we are here, iOS has activated
+  /// our audio session AT CALL PRIORITY and the car's SCO link is being held up as a real
+  /// call. Everything that used to sit after setActive(true) in startUnit() lives here now.
+  ///
+  /// Idempotent: didActivate can fire more than once (route changes, interruption
+  /// recovery). The isRunning guard is what makes a second call harmless.
+  private func beginAudio() {
+    if isRunning { return }
+    do {
+      try buildAndStartUnit()
+      os_log("beginAudio: VPIO unit running at CALL priority",
+             log: SixPagesVoicePlugin.log, type: .info)
+    } catch {
+      os_log("beginAudio: FAILED -- %{public}@", log: SixPagesVoicePlugin.log, type: .error,
+             String(describing: error))
+      endAudio()
+    }
+  }
+
+  /// Tear the audio engine down WITHOUT touching the call. Idempotent -- both the
+  /// didDeactivate path and the explicit stop path can reach it, and it must survive
+  /// being called twice.
+  private func endAudio() {
+    tearDownUnit()
+  }
+
+  private func buildAndStartUnit() throws {
     // Observe-only: report the route, steer nothing. See the comment block above.
     registerRouteListener()
     // Apple REQUIRES this for .playAndRecord. Its absence is the car-drop suspect.
@@ -1804,7 +2103,22 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     startDrain()
   }
 
+  /// BUILD 19: STOP THE CALL, then the audio. Order matters.
+  ///
+  /// requestEndCall() tells iOS the call is over, which releases the SCO link cleanly and
+  /// lets the car return to what it was doing. iOS then calls provider(_:didDeactivate:),
+  /// where the audio engine is torn down.
+  ///
+  /// We ALSO tear down directly here rather than trusting didDeactivate to arrive. If the
+  /// call never started (CXStartCallAction failed) there will be no didDeactivate at all,
+  /// and a session that never dies is worse than a redundant teardown. tearDownUnit() is
+  /// idempotent, so the double path is safe by construction.
   private func stopUnit() {
+    requestEndCall()
+    tearDownUnit()
+  }
+
+  private func tearDownUnit() {
     stopDrain()
     if let unit = ioUnit {
       AudioOutputUnitStop(unit)
@@ -2049,5 +2363,71 @@ extension SixPagesVoicePlugin: FlutterStreamHandler {
     self.captureSink = nil
     os_log("capture onCancel: stream released", log: SixPagesVoicePlugin.log, type: .info)
     return nil
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BUILD 19: CXProviderDelegate -- THE SEAM IOS OWNS
+//
+// This is the half of the contract we never wrote. iOS activates our audio session at
+// CALL priority and calls didActivate; THAT is when audio may begin. Apple, WWDC 2016
+// S230: "this is the point where we begin processing our call's audio."
+//
+// DO NOT start audio anywhere else. DO NOT call setActive(true) anywhere. The elevated
+// priority granted here is the entire reason the car holds the SCO link open, which is
+// the entire reason this build exists.
+// ══════════════════════════════════════════════════════════════════════════════
+extension SixPagesVoicePlugin: CXProviderDelegate {
+
+  /// The system tore down all calls (e.g. the provider was reset). Everything must stop.
+  public func providerDidReset(_ provider: CXProvider) {
+    os_log("CallKit: providerDidReset -- tearing everything down",
+           log: SixPagesVoicePlugin.log, type: .info)
+    currentCallUUID = nil
+    callKitState = "none"
+    endAudio()
+  }
+
+  /// Our CXStartCallAction is being performed. Apple: CONFIGURE the session here, do NOT
+  /// activate it. We already configured it in startUnit() (ahead of the call, which is
+  /// Apple's own workaround for the first-launch didActivate bug), so there is genuinely
+  /// nothing to do but fulfill.
+  public func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+    os_log("CallKit: CXStartCallAction performed",
+           log: SixPagesVoicePlugin.log, type: .info)
+    action.fulfill()
+  }
+
+  /// The user (or we) ended the call. Stop the audio; do not re-request an end.
+  public func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    os_log("CallKit: CXEndCallAction performed",
+           log: SixPagesVoicePlugin.log, type: .info)
+    callKitState = "ended"
+    currentCallUUID = nil
+    endAudio()
+    action.fulfill()
+  }
+
+  /// ★ THE MOMENT THE WHOLE BUILD TURNS ON. ★
+  ///
+  /// iOS has activated our session AT CALL PRIORITY. The car's SCO link is now being held
+  /// up as a genuine call -- the declaration Android has always made via requestAudioFocus
+  /// and iOS never made at all. NOW we build the VPIO unit and start the audio.
+  ///
+  /// If this never fires, ckActivates=0 on the strip and NO AUDIO EVER STARTS. That is the
+  /// known first-launch bug, and it is the first thing to check if the desk test is silent.
+  public func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+    callKitActivateCount += 1
+    callKitState = "active"
+    os_log("CallKit: didActivate -- session live at CALL priority. Starting audio.",
+           log: SixPagesVoicePlugin.log, type: .info)
+    beginAudio()
+  }
+
+  /// iOS deactivated the session. The call is over; the audio engine goes with it.
+  public func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+    os_log("CallKit: didDeactivate -- stopping audio",
+           log: SixPagesVoicePlugin.log, type: .info)
+    endAudio()
   }
 }
