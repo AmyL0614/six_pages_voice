@@ -42,6 +42,56 @@ import io.flutter.plugin.common.MethodChannel.Result
  * Contract:
  *   MethodChannel  six_pages_voice/control  — start() -> Bool, stop(), feedPlayback(Uint8List)
  *   EventChannel   six_pages_voice/capture  — streams clean PCM16 / 16 kHz / mono frames
+ *
+ * ---------------------------------------------------------------------------
+ * ANDROID BUILD A1 — AN INSTRUMENT, NOT A FIX. NO BEHAVIOR CHANGES.
+ * ---------------------------------------------------------------------------
+ *
+ * OPEN BUG: Bluetooth-to-car is flawless. USB-to-car (Android Auto projection)
+ * survives until the SCREEN SLEEPS, then the conversation dies.
+ *
+ * We do not know why, and we are NOT going to guess. Two hypotheses, each with
+ * a different fix, and the logs cannot currently distinguish them:
+ *
+ *   H1 — CLOBBERED. Under projection, Android Auto is the foreground app and
+ *        has its own audio stack talking to the car. setCommunicationDevice()
+ *        is arbitrated by whoever most recently owns MODE_IN_COMMUNICATION
+ *        (Android docs, AudioManager#setCommunicationDevice). If Android Auto
+ *        or the head unit asserts it at screen-off, WE LOSE THE ROUTE and the
+ *        code above never finds out — nothing re-reads it.
+ *        Fix would be: Telecom / ConnectionService (the Android analogue of the
+ *        CallKit fix that solved iOS — declare a CALL, not merely audio).
+ *
+ *   H2 — MUTED. The foreground service type is `microphone`. That declares
+ *        "I am recording." It does not declare "a call is in progress." Under
+ *        projection the system may be applying a different policy.
+ *        Fix would be: foregroundServiceType="phoneCall" + MANAGE_OWN_CALLS.
+ *
+ * ALSO SUSPECT, AND CHEAP TO RULE OUT: routePreference does not contain
+ * TYPE_BUS (21) or TYPE_DOCK (13). AAOS enumerates automotive audio as
+ * AUDIO_DEVICE_OUT_BUS. A projected head unit that offers itself as BUS would
+ * never be selected — we would silently fall through to TYPE_BUILTIN_SPEAKER,
+ * which is ALWAYS available, so the "no preferred device / Offered: [...]"
+ * branch that would have told us NEVER FIRES.
+ *
+ * WHAT A1 ADDS (all diagnostic, all Log.i, nothing changes what the code does):
+ *   - snapshot(): a single-line strip, same discipline as the iOS strip.
+ *   - EVERY available communication device logged EVERY time we route, with
+ *     its raw integer type — not just when we fail to match one.
+ *   - the actual return of setCommunicationDevice(), and a read-back of what
+ *     the framework says the device IS afterwards (they can disagree).
+ *   - a SCREEN_OFF / SCREEN_ON receiver that dumps the strip at exactly the
+ *     moment of death. This is the whole point. The Hard Rules say a strip
+ *     read after the event is meaningless; this one is read AT the event.
+ *   - a heartbeat that re-reads mode + communicationDevice every ~5s, so a
+ *     route we lose while the screen is dark is TIMESTAMPED, not inferred.
+ *
+ * HOW TO READ IT, next session:
+ *   Look at the strip at SCREEN_OFF and the strip 5s later.
+ *   commDev CHANGED or went null  -> H1. Build Telecom.
+ *   commDev UNCHANGED, mic silent -> H2. Change the service type.
+ *   commDev was never the car     -> the routePreference gap. Add TYPE_BUS.
+ * ---------------------------------------------------------------------------
  */
 class SixPagesVoicePlugin :
     FlutterPlugin,
@@ -98,6 +148,125 @@ class SixPagesVoicePlugin :
 
     // Live only for the duration of a session; nulled in clearSpeakerRoute().
     private var routeListener: AudioDeviceCallback? = null
+
+    // --- BUILD A1 DIAGNOSTICS ------------------------------------------------
+    // Everything below this line is an INSTRUMENT. None of it changes behavior.
+    // It exists because the USB-to-car screen-off failure cannot currently be
+    // told apart from three different causes, and we are not going to guess.
+
+    // Screen state, and the strip frozen AT the moment the screen went dark.
+    // A reading taken after the fact is worthless (this is the Android version
+    // of the iOS post-teardown lesson). We capture at the transition.
+    @Volatile private var screenOffCount = 0
+    @Volatile private var lastScreenEvent = "-"
+    private var screenReceiver: android.content.BroadcastReceiver? = null
+
+    // Heartbeat: re-reads mode + communicationDevice every 5s while a session is
+    // live. A route lost with the screen dark gets a TIMESTAMP instead of an
+    // inference. Cheap: two getters, once per 5 seconds.
+    private var heartbeat: Runnable? = null
+    private val heartbeatMs = 5000L
+    @Volatile private var heartbeatTicks = 0
+
+    // What we ASKED for vs what the framework SAYS we got. These can disagree,
+    // and that disagreement is the entire H1 hypothesis.
+    @Volatile private var requestedRouteType = -1
+    @Volatile private var lastSetCommDevOk: Boolean? = null
+    @Volatile private var routeSelectCount = 0
+    @Volatile private var routeLostCount = 0
+
+    // Capture liveness. If the mic is silently muted (H2), frames stop arriving
+    // but nothing else in the system reports an error. This counter is how we
+    // see that: it simply STOPS INCREASING while everything else looks healthy.
+    @Volatile private var captureFrames = 0L
+    @Volatile private var renderFrames = 0L
+
+    // Was the session ever routed to something that is plausibly the car?
+    @Volatile private var everRoutedTo = "-"
+
+    /**
+     * The Android diagnostic strip. One line. Same discipline as iOS.
+     *
+     * Read it at SCREEN_OFF, then read the next heartbeat 5 seconds later.
+     * The DIFFERENCE between those two lines is the answer.
+     */
+    private fun snapshot(why: String): String {
+        val am = audioManager()
+        val mode = am?.mode ?: -1
+        val modeName = when (mode) {
+            AudioManager.MODE_NORMAL -> "NORMAL"
+            AudioManager.MODE_IN_CALL -> "IN_CALL"
+            AudioManager.MODE_IN_COMMUNICATION -> "IN_COMM"
+            AudioManager.MODE_RINGTONE -> "RINGTONE"
+            else -> "mode-$mode"
+        }
+
+        // THE LOAD-BEARING READ. What does the framework think the comms device
+        // is, RIGHT NOW? Not what we asked for. What it IS.
+        var commDev = "n/a"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am != null) {
+            val d = try { am.communicationDevice } catch (_: Exception) { null }
+            commDev = if (d == null) "NULL" else "${routeName(d.type)}(${d.type})"
+        }
+
+        val focus = if (focusRequest != null || focusListener != null) "held" else "none"
+        val trackState = audioTrack?.let {
+            when (it.playState) {
+                AudioTrack.PLAYSTATE_PLAYING -> "playing"
+                AudioTrack.PLAYSTATE_PAUSED -> "paused"
+                AudioTrack.PLAYSTATE_STOPPED -> "stopped"
+                else -> "state-${it.playState}"
+            }
+        } ?: "null"
+        val recState = audioRecord?.let {
+            if (it.recordingState == AudioRecord.RECORDSTATE_RECORDING) "recording" else "STOPPED"
+        } ?: "null"
+
+        return "STRIP[$why] " +
+            "mode=$modeName; commDev=$commDev; wanted=${routeName(requestedRouteType)}($requestedRouteType); " +
+            "setCommDevOk=${lastSetCommDevOk ?: "-"}; everRouted=$everRoutedTo; " +
+            "routeSelects=$routeSelectCount; routeLost=$routeLostCount; " +
+            "focus=$focus; focusLoss=$focusLossCount; " +
+            "capturing=$capturing; rec=$recState; track=$trackState; " +
+            "captureFrames=$captureFrames; renderFrames=$renderFrames; " +
+            "aec=${if (aecHandle != 0L) "up" else "DOWN"}; " +
+            "screenOffs=$screenOffCount; lastScreen=$lastScreenEvent; hb=$heartbeatTicks"
+    }
+
+    private fun logStrip(why: String) {
+        Log.i(tag, snapshot(why))
+    }
+
+    /**
+     * Dumps EVERY communication device the framework is currently offering, with
+     * its RAW INTEGER TYPE.
+     *
+     * The old code only logged the offered list when NOTHING matched
+     * routePreference. But TYPE_BUILTIN_SPEAKER is in routePreference and is
+     * ALWAYS available — so that branch could never fire, and a car head unit
+     * enumerating as an unlisted type (TYPE_BUS=21, TYPE_DOCK=13) would be
+     * invisible while we quietly played to the phone speaker.
+     *
+     * Now it fires EVERY time. Read the integers. If the car is in this list
+     * under a type that is not in routePreference, that alone is the bug.
+     */
+    private fun logOfferedDevices(why: String) {
+        val am = audioManager() ?: return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            Log.i(tag, "OFFERED[$why] pre-S, no availableCommunicationDevices()")
+            return
+        }
+        val available = try { am.availableCommunicationDevices } catch (_: Exception) { emptyList() }
+        if (available.isEmpty()) {
+            Log.w(tag, "OFFERED[$why] EMPTY — the framework is offering NO communication devices")
+            return
+        }
+        val listed = available.joinToString(", ") { d ->
+            val known = routePreference.contains(d.type)
+            "${routeName(d.type)}(type=${d.type}${if (known) "" else " *NOT-IN-PREFERENCE*"}, id=${d.id}, name=${d.productName})"
+        }
+        Log.i(tag, "OFFERED[$why] $listed")
+    }
 
     // --- AEC3 render->capture delay, MEASURED (not guessed) --------------
     //
@@ -187,6 +356,7 @@ class SixPagesVoicePlugin :
                         audioTrack?.write(pcm, 0, pcm.size)
                         framesWritten += (pcm.size / 2).toLong()
                     }
+                    renderFrames++  // A1: Joe is still being fed to us.
                 }
                 result.success(null)
             }
@@ -238,15 +408,43 @@ class SixPagesVoicePlugin :
         // session in MODE_IN_COMMUNICATION can silently clobber the route we set
         // above and drop us back to the earpiece. Setting it last makes us the
         // final word, and closes the intermittent "sometimes earpiece" race.
-        selectBestRoute()
+        selectBestRoute("streams-live")
+
+        // A1 instruments. Both are diagnostic only.
+        registerScreenReceiver()
+        startHeartbeat()
+        logStrip("SESSION_START")
         return true
     }
 
     private fun stopEngine() {
+        // A1: freeze the strip BEFORE teardown wipes it. The iOS Hard Rules were
+        // written in blood over exactly this: a strip read after stopUnit() is
+        // meaningless, and we reasoned off one for hours. This is the state at
+        // the MOMENT OF DEATH, whatever killed it.
+        logStrip("SESSION_END")
+
+        stopHeartbeat()
+        unregisterScreenReceiver()
         stopCapture()
         stopPlayback()
         clearSpeakerRoute()
         abandonFocus()
+
+        // Reset diagnostic counters for the next session so a stale number from
+        // the last run can never be mistaken for a live one.
+        captureFrames = 0L
+        renderFrames = 0L
+        routeSelectCount = 0
+        routeLostCount = 0
+        focusLossCount = 0
+        heartbeatTicks = 0
+        screenOffCount = 0
+        requestedRouteType = -1
+        lastSetCommDevOk = null
+        everRoutedTo = "-"
+        lastScreenEvent = "-"
+
         // Last: tears down the notification and releases the wakelock.
         appContext?.let { VoiceSessionService.stop(it) }
     }
@@ -382,8 +580,15 @@ class SixPagesVoicePlugin :
      * boot/state-dependent, which is why routing "worked one session, not the next"
      * with no code change. Setting the route LAST makes us the final word.
      */
-    private fun selectBestRoute() {
+    private fun selectBestRoute() = selectBestRoute("route")
+
+    private fun selectBestRoute(why: String) {
         val am = audioManager() ?: return
+        routeSelectCount++
+
+        // A1: log the full offered list EVERY time, not only on total failure.
+        // This is the line that would have caught a car enumerating as TYPE_BUS.
+        logOfferedDevices(why)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val available = am.availableCommunicationDevices
@@ -402,21 +607,41 @@ class SixPagesVoicePlugin :
             }
 
             if (chosen != null) {
+                requestedRouteType = chosen.type
                 // No-op if it is already the active route — avoids audio glitches
                 // from redundant re-selection on every device callback.
                 if (am.communicationDevice?.id != chosen.id) {
                     val ok = am.setCommunicationDevice(chosen)
-                    Log.i(tag, "Route -> ${routeName(chosen.type)} (ok=$ok)")
+                    lastSetCommDevOk = ok
+
+                    // A1: READ IT BACK. setCommunicationDevice() returning true
+                    // means the REQUEST was accepted. It does NOT mean the route
+                    // is what we asked for — arbitration happens after, and the
+                    // owner of MODE_IN_COMMUNICATION wins. If these two disagree,
+                    // that disagreement IS the bug, and until now nothing looked.
+                    val actual = try { am.communicationDevice } catch (_: Exception) { null }
+                    val actualName = if (actual == null) "NULL" else "${routeName(actual.type)}(${actual.type})"
+                    val agrees = actual?.type == chosen.type
+                    if (agrees) {
+                        everRoutedTo = routeName(chosen.type)
+                        Log.i(tag, "Route[$why] -> ${routeName(chosen.type)}(${chosen.type}) ok=$ok CONFIRMED=$actualName")
+                    } else {
+                        Log.w(tag, "Route[$why] -> ASKED ${routeName(chosen.type)}(${chosen.type}) ok=$ok but framework says $actualName — MISMATCH")
+                    }
                 } else {
-                    Log.i(tag, "Route unchanged (${routeName(chosen.type)})")
+                    everRoutedTo = routeName(chosen.type)
+                    Log.i(tag, "Route[$why] unchanged (${routeName(chosen.type)}(${chosen.type}))")
                 }
             } else {
                 @Suppress("DEPRECATION")
                 am.isSpeakerphoneOn = true
-                // Log what WAS offered. If a car head unit enumerates as a type that is
-                // not in routePreference, this line is the ONLY thing that will tell us.
+                requestedRouteType = -1
+                // Retained from the original. This branch could never fire while
+                // TYPE_BUILTIN_SPEAKER sits in routePreference and is always
+                // available — which is exactly why logOfferedDevices() above now
+                // runs unconditionally instead of only here.
                 val offered = available.joinToString(", ") { "${routeName(it.type)}(${it.type})" }
-                Log.i(tag, "Route -> speakerphone (no preferred device). Offered: [$offered]")
+                Log.w(tag, "Route[$why] -> speakerphone (no preferred device). Offered: [$offered]")
             }
         } else {
             // Pre-S: no setCommunicationDevice(). A connected headset (BT or wired)
@@ -456,6 +681,17 @@ class SixPagesVoicePlugin :
         audioManager()?.unregisterAudioDeviceCallback(cb)
     }
 
+    // BUILD A1: this map was BLIND to exactly the devices we are hunting.
+    // A car under USB projection does not enumerate as any of the six original
+    // entries. TYPE_BUS (21) is the AAOS automotive audio device. TYPE_DOCK (13)
+    // is what some head units present as. TYPE_USB_DEVICE (11) and
+    // TYPE_USB_ACCESSORY (12) are the raw USB audio classes. Without names, the
+    // strip printed "type-21" and meant nothing to a human reading it at 2am.
+    //
+    // NAMING A TYPE DOES NOT SELECT IT. routePreference is UNCHANGED — this is
+    // an instrument, not a fix, and adding TYPE_BUS to the preference list would
+    // be a second variable in the same build. If the logs show BUS, we add it
+    // NEXT build, alone, and prove it.
     private fun routeName(type: Int): String = when (type) {
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth"
         AudioDeviceInfo.TYPE_BLE_HEADSET -> "bluetooth-le"
@@ -464,7 +700,130 @@ class SixPagesVoicePlugin :
         AudioDeviceInfo.TYPE_USB_HEADSET -> "usb-headset"
         AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
         AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "earpiece"
+        // --- A1: the ones we were blind to ---
+        AudioDeviceInfo.TYPE_BUS -> "BUS-automotive"
+        AudioDeviceInfo.TYPE_DOCK -> "DOCK"
+        AudioDeviceInfo.TYPE_USB_DEVICE -> "usb-device"
+        AudioDeviceInfo.TYPE_USB_ACCESSORY -> "usb-accessory"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "bluetooth-a2dp"
+        AudioDeviceInfo.TYPE_HEARING_AID -> "hearing-aid"
+        AudioDeviceInfo.TYPE_TELEPHONY -> "telephony"
+        AudioDeviceInfo.TYPE_LINE_ANALOG -> "line-analog"
+        AudioDeviceInfo.TYPE_LINE_DIGITAL -> "line-digital"
+        AudioDeviceInfo.TYPE_HDMI -> "hdmi"
+        AudioDeviceInfo.TYPE_AUX_LINE -> "aux-line"
+        AudioDeviceInfo.TYPE_UNKNOWN -> "unknown"
+        -1 -> "none"
         else -> "type-$type"
+    }
+
+    // --- BUILD A1: SCREEN TRANSITION WATCH ----------------------------------
+    //
+    // THE INSTRUMENT THIS BUILD EXISTS FOR.
+    //
+    // The failure happens AT screen-off, over USB, and nowhere else. So we read
+    // the strip AT screen-off — not before (nothing is wrong yet) and not after
+    // (the iOS Hard Rules already taught us what a post-mortem strip is worth).
+    //
+    // Then the heartbeat reads it again 5 seconds later. Two lines, five seconds
+    // apart, straddling the exact moment the conversation dies. Whatever changed
+    // between them is the bug. There is no third possibility to argue about.
+    private fun registerScreenReceiver() {
+        val ctx = appContext ?: return
+        if (screenReceiver != null) return
+
+        val rx = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context?, intent: android.content.Intent?) {
+                when (intent?.action) {
+                    android.content.Intent.ACTION_SCREEN_OFF -> {
+                        screenOffCount++
+                        lastScreenEvent = "OFF"
+                        Log.w(tag, "=== SCREEN OFF — reading strip AT the transition ===")
+                        logOfferedDevices("screen-off")
+                        logStrip("SCREEN_OFF")
+                    }
+                    android.content.Intent.ACTION_SCREEN_ON -> {
+                        lastScreenEvent = "ON"
+                        Log.i(tag, "=== SCREEN ON ===")
+                        logOfferedDevices("screen-on")
+                        logStrip("SCREEN_ON")
+                    }
+                    android.content.Intent.ACTION_USER_PRESENT -> {
+                        lastScreenEvent = "UNLOCK"
+                        logStrip("USER_PRESENT")
+                    }
+                }
+            }
+        }
+
+        val filter = android.content.IntentFilter().apply {
+            addAction(android.content.Intent.ACTION_SCREEN_OFF)
+            addAction(android.content.Intent.ACTION_SCREEN_ON)
+            addAction(android.content.Intent.ACTION_USER_PRESENT)
+        }
+
+        // Android 14+ requires the export flag to be explicit. These are protected
+        // system broadcasts; NOT_EXPORTED is correct and sufficient.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ctx.registerReceiver(rx, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            ctx.registerReceiver(rx, filter)
+        }
+        screenReceiver = rx
+        Log.i(tag, "Screen transition receiver registered")
+    }
+
+    private fun unregisterScreenReceiver() {
+        val rx = screenReceiver ?: return
+        screenReceiver = null
+        try {
+            appContext?.unregisterReceiver(rx)
+        } catch (e: Exception) {
+            Log.w(tag, "Screen receiver unregister failed: ${e.message}")
+        }
+    }
+
+    // Heartbeat. Two getters every 5 seconds. Its only job is to TIMESTAMP a
+    // route we lose while the screen is dark, instead of us inferring it later
+    // from a corpse. It also detects the H1 signature directly: if commDev
+    // changes out from under us without any device being added or removed,
+    // somebody else took the route. That is arbitration, and it is not visible
+    // through AudioDeviceCallback — which is precisely why we never saw it.
+    private fun startHeartbeat() {
+        if (heartbeat != null) return
+        val r = object : Runnable {
+            override fun run() {
+                if (!capturing && audioTrack == null) return  // session gone; stop.
+                heartbeatTicks++
+
+                val am = audioManager()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am != null) {
+                    val actual = try { am.communicationDevice } catch (_: Exception) { null }
+                    val actualType = actual?.type ?: -1
+                    if (requestedRouteType != -1 && actualType != requestedRouteType) {
+                        routeLostCount++
+                        Log.e(
+                            tag,
+                            "!!! ROUTE LOST — we hold ${routeName(requestedRouteType)}($requestedRouteType) " +
+                                "but framework now says ${routeName(actualType)}($actualType). " +
+                                "Something else won MODE_IN_COMMUNICATION arbitration. THIS IS H1."
+                        )
+                        logStrip("ROUTE_LOST")
+                        logOfferedDevices("route-lost")
+                    }
+                }
+
+                logStrip("HB")
+                mainHandler.postDelayed(this, heartbeatMs)
+            }
+        }
+        heartbeat = r
+        mainHandler.postDelayed(r, heartbeatMs)
+    }
+
+    private fun stopHeartbeat() {
+        heartbeat?.let { mainHandler.removeCallbacks(it) }
+        heartbeat = null
     }
 
     private fun clearSpeakerRoute() {
@@ -558,6 +917,9 @@ class SixPagesVoicePlugin :
     // or "FALLBACK" (buffer math).
     @Volatile private var lastDelaySource = "FALLBACK"
 
+    // A1: throttles the per-frame HEAD diag line to ~1/sec.
+    @Volatile private var headDiagCounter = 0
+
     private fun currentStreamDelayMs(): Int {
         val track = audioTrack ?: run { lastDelaySource = "FALLBACK"; return bufferFallbackDelayMs() }
         val written: Long
@@ -590,10 +952,18 @@ class SixPagesVoicePlugin :
             0
         }
         val framesPlayed = headRaw.toLong() and 0xFFFFFFFFL  // unsigned
-        // DIAGNOSTIC (temporary): show the raw numbers the phone reports so we
-        // can see WHY the HEAD measurement is being accepted or rejected.
-        val inFlightDiag = written - framesPlayed
-        Log.i(tag, "HEAD diag: framesPlayed=$framesPlayed written=$written inFlight=$inFlightDiag bufFrames=$trackBufferFrames")
+        // DIAGNOSTIC: the raw numbers the phone reports, so we can see WHY the
+        // HEAD measurement is accepted or rejected.
+        //
+        // A1: THROTTLED. This fired on EVERY capture frame — 50 lines/second.
+        // Over a car test long enough to reach screen-off, it buries the strip
+        // we are actually here to read. Now ~1/sec (every 50th call). Same
+        // information, legible logcat. NOT a behavior change; a log-volume fix.
+        headDiagCounter++
+        if (headDiagCounter % 50 == 0) {
+            val inFlightDiag = written - framesPlayed
+            Log.i(tag, "HEAD diag: framesPlayed=$framesPlayed written=$written inFlight=$inFlightDiag bufFrames=$trackBufferFrames")
+        }
         if (framesPlayed > 0L) {
             val inFlight = written - framesPlayed
             if (inFlight in 0..(sampleRate.toLong())) {
@@ -657,6 +1027,13 @@ class SixPagesVoicePlugin :
             while (capturing) {
                 val read = record.read(buf, 0, buf.size)
                 if (read > 0) {
+                    // A1: the mic is alive. If Android SILENTLY MUTES us under
+                    // projection (H2), read() keeps returning bytes but this is
+                    // the counter to watch against renderFrames: Joe still
+                    // speaking (renderFrames climbing) while captureFrames goes
+                    // flat is the signature of a muted mic, and it is otherwise
+                    // completely invisible — no error, no callback, nothing.
+                    captureFrames++
                     val frame = if (read == buf.size) buf.copyOf() else buf.copyOf(read)
                     // Clean this frame in place via AEC3 before sending it on.
                     // The capture thread is the ONLY caller of nativeProcessCapture,
