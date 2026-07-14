@@ -9,6 +9,63 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
+// BUILD 22: AN INSTRUMENT, NOT A FIX. NO BEHAVIOR CHANGES. NONE.
+//
+// FIVE BUILDS -- 19, 19a, 19b, 20, 21 -- all died the same way on a bare iPad: the button
+// spins, the strip is bare, callKit=none. Each build was a HYPOTHESIS, reasoned from the
+// source and from Apple's docs, and each one was WRONG. Reporting order. Object lifetime.
+// All plausible. All false.
+//
+// THE REAL BUG IS NOT IN THE SWIFT. IT IS IN THE WORKFLOW.
+//
+// requestStartCall() catches the refusal, formats error.localizedDescription -- and sends
+// it to os_log. THERE IS NO MAC IN THIS PROJECT. os_log is a black hole. iOS has been
+// telling us, in plain English, EXACTLY why it refused this call, on every single one of
+// those five builds, and we threw the message away every time and then guessed.
+//
+// Build 12 already wrote the rule: "THE STRIP IS THE ONLY iOS INSTRUMENT. os_log is
+// unreadable in this workflow (Windows + TestFlight, no Mac), so a counter that is not on
+// this line does not exist." We wrote that down and then spent five builds ignoring it.
+//
+// WHAT THIS BUILD ADDS -- ALL DIAGNOSTIC, ALL ON THE STRIP:
+//
+//   ckError=   The refusal reason FROM iOS, in words, plus NSError domain#code.
+//              THIS IS PROBABLY THE ENTIRE ANSWER AND IT HAS ALWAYS BEEN AVAILABLE.
+//
+//   ckTrail=[] A breadcrumb of every CallKit lifecycle event, in order. callKit=none was
+//              AMBIGUOUS -- it could mean refused, OR never-made, OR completion-never-
+//              returned. Three bugs, one face. That ambiguity is what we kept guessing
+//              across. The trail ends it:
+//                [start]                -> the request was NEVER MADE (no controller)
+//                [start,req]            -> dispatched; the completion NEVER CAME BACK
+//                [start,req,REFUSED]    -> iOS said no  ** READ ckError **
+//                [start,req,ok]         -> accepted, but perform() never fired
+//                [start,req,ok,perform] -> fulfilled, but session NEVER ELEVATED
+//                [...,ACTIVATE]         -> didActivate fired (never once seen yet)
+//                [...,ACTIVATE,audioUp] -> SUCCESS, audio live
+//                [...,TIMEOUT]          -> 4s deadman, Dart told FALSE
+//                [...,endCall]          -> someone HUNG UP
+//                [...,deactivate]       -> system took the session away
+//                [...,RESET]            -> iOS nuked the provider
+//                [...,dartStop]         -> Dart called stop(); WE hung up
+//
+//   LAST SESSION: snapshot frozen INSIDE tearDownUnit(), before the counters are wiped.
+//              The Hard Rules say a post-teardown strip is meaningless -- and tonight we
+//              reasoned off one AGAIN. Now the strip carries the state at the MOMENT OF
+//              DEATH, which is the only moment that ever mattered.
+//
+//   The silent `guard let controller = callController else { return }` in requestStartCall
+//   now records WHY it bailed instead of vanishing without a trace.
+//
+// NOTHING ELSE MOVED. Build 21's retained instance stands. Build 20's reportOutgoingCall
+// ordering stands. CallKit architecture (19), async start seam + 4s deadman (19b),
+// setPreferredInput (17), 180s ring (11) all intact. setActive(true) still absent from the
+// entire file. NOTHING IN DART CHANGED. Android untouched.
+//
+// READ ckTrail FIRST. Then ckError. Then stop guessing.
+//
+// ───────────────────────────────────────────────────────────────────────────
+//
 // BUILD 21: THE PLUGIN INSTANCE WAS DEAD. FOUR BUILDS DIED ON TOP OF IT.
 //
 // Builds 19, 19a, 19b and 20 ALL came back "no session started" on the bare iPad, with
@@ -1009,6 +1066,53 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   private var callKitState = "none"        // none | requested | active | ended
   private var callKitActivateCount = 0     // did provider(didActivate:) EVER fire?
 
+  // ╔═════════════════════════════════════════════════════════════════════════════╗
+  // ║ BUILD 22: AN INSTRUMENT, NOT A FIX. NOTHING HERE CHANGES BEHAVIOR.          ║
+  // ╚═════════════════════════════════════════════════════════════════════════════╝
+  //
+  // Builds 19, 19a, 19b, 20 and 21 all failed the same way on a bare iPad: the button
+  // spins, the strip is bare, callKit=none. FIVE BUILDS. Each one was a hypothesis
+  // reasoned from source and Apple docs, and each one was WRONG, because none of them
+  // could be tested against what iOS was actually saying.
+  //
+  // AND IOS HAS BEEN SAYING IT THE WHOLE TIME. requestStartCall() catches the refusal,
+  // formats error.localizedDescription into os_log -- AND THROWS IT AWAY. There is no Mac
+  // in this workflow. os_log is a black hole. As Build 12 already wrote down: "a counter
+  // that is not on this strip does not exist."
+  //
+  // We built five fixes for a problem the system was willing to name, and we never gave
+  // it anywhere to say it. THAT is the actual bug in this workflow, and this build fixes
+  // THAT before it fixes anything else.
+  //
+  // ckError -- the refusal reason, in words, from iOS. Most likely the whole answer.
+  private var callKitError = "-"
+
+  // ckTrail -- the lifecycle breadcrumb. Every CallKit event appends one token, in order.
+  // Reading the sequence tells us WHERE the chain breaks and WHO broke it:
+  //
+  //   ckTrail=[start]                                  -> ensureCallKit/controller is nil.
+  //                                                       The request was NEVER MADE.
+  //   ckTrail=[start,req]                              -> request dispatched, completion
+  //                                                       NEVER CAME BACK.
+  //   ckTrail=[start,req,REFUSED]                      -> iOS said no. READ ckError.
+  //   ckTrail=[start,req,ok]                           -> accepted, but perform() never
+  //                                                       fired. CallKit went silent.
+  //   ckTrail=[start,req,ok,perform]                   -> fulfilled, but no didActivate.
+  //                                                       THE session was never elevated.
+  //   ckTrail=[start,req,ok,perform,ACTIVATE]          -> got it. beginAudio() then failed.
+  //   ckTrail=[...,ACTIVATE,audioUp]                   -> SUCCESS. Audio is live.
+  //   ckTrail=[...,TIMEOUT]                            -> 4s deadman. Dart told FALSE.
+  //   ckTrail=[...,deactivate] / [...,endCall]         -> something HUNG UP on us.
+  //   ckTrail=[...,RESET]                              -> providerDidReset. iOS nuked it.
+  //   ckTrail=[...,dartStop]                           -> Dart called stop(). WE hung up.
+  //
+  // Capped so a long session cannot blow the strip out.
+  private var callKitTrail: [String] = []
+
+  private func ckMark(_ token: String) {
+    if callKitTrail.count < 24 { callKitTrail.append(token) }
+  }
+
   // ══ BUILD 19b: THE ASYNC SEAM ═════════════════════════════════════════════
   // Build 19 BROKE THE DART CONTRACT and it took a dead button to find out.
   //
@@ -1084,8 +1188,27 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   /// car a call is genuinely in progress -- which is the entire point of this build.
   /// Audio does NOT start here. It starts in provider(_:didActivate:).
   private func requestStartCall() {
+    ckMark("start")
     ensureCallKit()
-    guard let controller = callController else { return }
+
+    // BUILD 22: THIS GUARD USED TO FAIL SILENTLY. If callController were nil we returned
+    // with NO TRACE WHATSOEVER -- the call would simply never be made, and the strip would
+    // read callKit=none, utterly indistinguishable from a refusal. Two completely
+    // different failures wearing the same face. Now they don't.
+    guard let controller = callController else {
+      callKitError = "callController is nil"
+      ckMark("NOCTRL")
+      os_log("CallKit: NO CONTROLLER -- request never made",
+             log: SixPagesVoicePlugin.log, type: .error)
+      return
+    }
+
+    // BUILD 22: and the provider. ensureCallKit() builds it, but if CXProvider
+    // construction ever failed we would want to SEE that, not infer it three builds later.
+    if callProvider == nil {
+      callKitError = "callProvider is nil"
+      ckMark("NOPROV")
+    }
 
     let uuid = UUID()
     currentCallUUID = uuid
@@ -1097,6 +1220,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     action.isVideo = false
 
     let transaction = CXTransaction(action: action)
+    ckMark("req")
     controller.request(transaction) { [weak self] error in
       guard let self = self else { return }
       if let error = error {
@@ -1104,11 +1228,28 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         // fire. Fail LOUDLY rather than sitting in a silent dead state.
         self.callKitState = "none"
         self.currentCallUUID = nil
+
+        // ╔═══════════════════════════════════════════════════════════════════════╗
+        // ║ BUILD 22: THE ANSWER GOES ON THE STRIP. NOT INTO os_log.             ║
+        // ╚═══════════════════════════════════════════════════════════════════════╝
+        //
+        // For FIVE BUILDS iOS has been telling us exactly why it refused this call, in
+        // plain English, on this very line -- and we have been writing it to a log that
+        // CANNOT BE READ from Windows. Every failed hypothesis in this series (19, 19a,
+        // 19b, 20, 21) was made blind, standing next to an answer that was already here.
+        //
+        // Build 12 wrote the rule down and we did not follow it: "a counter that is not
+        // on this strip does not exist." Neither does an error string.
+        let ns = error as NSError
+        self.callKitError = "\(error.localizedDescription) [\(ns.domain)#\(ns.code)]"
+        self.ckMark("REFUSED")
+
         os_log("CallKit: CXStartCallAction FAILED -- %{public}@",
                log: SixPagesVoicePlugin.log, type: .error, error.localizedDescription)
         return
       }
       self.callKitState = "requested"
+      self.ckMark("ok")
       os_log("CallKit: call requested -- waiting for didActivate",
              log: SixPagesVoicePlugin.log, type: .info)
 
@@ -1390,6 +1531,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       let timeout = DispatchWorkItem { [weak self] in
         guard let self = self else { return }
         guard self.pendingStartResult != nil else { return }
+        self.ckMark("TIMEOUT")   // BUILD 22: the 4s deadman. Dart is being told FALSE.
         os_log("start: TIMED OUT — provider(didActivate:) never fired in 4s. ckActivates=%d. Audio never started.",
                log: SixPagesVoicePlugin.log, type: .error, self.callKitActivateCount)
         self.stopUnit()
@@ -1409,6 +1551,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         resolveStart(false)
       }
     case "stop":
+      ckMark("dartStop")   // BUILD 22: DART called stop(). WE hung up, nobody else.
       stopUnit()
       os_log("stop: unit torn down", log: SixPagesVoicePlugin.log, type: .info)
       result(nil)
@@ -1439,6 +1582,28 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         // provider(didActivate:) never fired, the VPIO unit was never built, and NO OTHER
         // NUMBER ON THIS STRIP MEANS ANYTHING. Read it before you read anything else.
         + "callKit=\(callKitState); ckActivates=\(callKitActivateCount); "
+        // ╔═══════════════════════════════════════════════════════════════════════╗
+        // ║ BUILD 22: READ ckTrail FIRST. IT IS NOW THE FIRST NUMBER ON THE STRIP.║
+        // ╚═══════════════════════════════════════════════════════════════════════╝
+        //
+        // callKit=none was AMBIGUOUS and it cost five builds. It could mean the call was
+        // refused, OR that the call was never made at all, OR that the completion never
+        // returned. Three different bugs, one indistinguishable symptom, and we guessed
+        // between them three times and were wrong three times.
+        //
+        // ckTrail ENDS THE AMBIGUITY. It is a breadcrumb of every CallKit event, in order:
+        //   [start]                  -> ensureCallKit failed. Request NEVER MADE.
+        //   [start,req]              -> dispatched; completion NEVER CAME BACK.
+        //   [start,req,REFUSED]      -> iOS said NO. **READ ckError. THAT IS THE ANSWER.**
+        //   [start,req,ok]           -> accepted, but perform() never fired.
+        //   [start,req,ok,perform]   -> fulfilled, but the session was NEVER ELEVATED.
+        //   [...,ACTIVATE]           -> didActivate FIRED. beginAudio then failed.
+        //   [...,ACTIVATE,audioUp]   -> SUCCESS. Audio is live.
+        //   [...,TIMEOUT]            -> 4s deadman; Dart told FALSE.
+        //   [...,endCall/deactivate] -> something HUNG UP.
+        //   [...,RESET]              -> iOS nuked the provider.
+        //   [...,dartStop]           -> Dart called stop(). WE hung up.
+        + "ckTrail=[\(callKitTrail.joined(separator: ","))]; ckError=\(callKitError); "
         // BUILD 18: THE CAPTURE COUNTERS GO FIRST, AHEAD OF input=. In a car, "did the
         // mic actually RUN" now outranks "which mic did we PICK" -- Build 17 already
         // proved we pick the right one and the car hangs up on us anyway.
@@ -2038,6 +2203,11 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     callKitActivateCount = 0
     callKitState = "none"
 
+    // BUILD 22: fresh trail per session, so the strip describes THIS attempt and not an
+    // accumulation of every attempt since launch.
+    callKitTrail.removeAll()
+    callKitError = "-"
+
     // Session config FIRST, call SECOND. This ordering is Apple's own documented
     // workaround for the known first-launch bug where didActivate never fires: configure
     // the session BEFORE reporting the call, not inside the action handler.
@@ -2135,6 +2305,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     }
     do {
       try buildAndStartUnit()
+      ckMark("audioUp")   // BUILD 22: SUCCESS. The VPIO unit is RUNNING. Audio is live.
       os_log("beginAudio: VPIO unit running at CALL priority",
              log: SixPagesVoicePlugin.log, type: .info)
 
@@ -2417,6 +2588,28 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   }
 
   private func tearDownUnit() {
+    // ╔═════════════════════════════════════════════════════════════════════════════╗
+    // ║ BUILD 22: SNAPSHOT BEFORE THE WIPE. A POST-TEARDOWN STRIP IS A CORPSE.      ║
+    // ╚═════════════════════════════════════════════════════════════════════════════╝
+    //
+    // Everything below this point CLEARS the session: playback.clear(), primed=false,
+    // counters to zero. The iOS Hard Rules already say it -- "a strip read after ending
+    // the conversation is MEANINGLESS. Hours were spent reasoning from a post-teardown
+    // primed=false." Tonight it happened AGAIN, on the car strip.
+    //
+    // The CallKit trail is the one thing that must SURVIVE the wipe, because the whole
+    // point of it is to say HOW THE SESSION DIED -- and by definition that is only
+    // readable after the session is dead. So we freeze it here, at the moment of death,
+    // and the strip keeps showing it afterward.
+    //
+    // The trail is NOT cleared here. It is cleared in startUnit(), on the NEXT attempt.
+    if !callKitTrail.isEmpty {
+      lastDiagnostics = "LAST SESSION: ckTrail=[\(callKitTrail.joined(separator: ","))]; "
+        + "ckError=\(callKitError); ckActivates=\(callKitActivateCount); "
+        + "renderCalls=\(renderCalls); captureBytes=\(captureByteCount); "
+        + "droppedBytes=\(playback.droppedBytes) || NOW: "
+    }
+
     // BUILD 19b: never leave a Dart future hanging. If teardown happens while a start is
     // still in flight (stop tapped fast, CallKit refused the call, provider reset), the
     // held FlutterResult must be answered or the Dart side waits forever.
@@ -2684,6 +2877,7 @@ extension SixPagesVoicePlugin: CXProviderDelegate {
 
   /// The system tore down all calls (e.g. the provider was reset). Everything must stop.
   public func providerDidReset(_ provider: CXProvider) {
+    ckMark("RESET")   // BUILD 22: iOS nuked the provider out from under us.
     os_log("CallKit: providerDidReset -- tearing everything down",
            log: SixPagesVoicePlugin.log, type: .info)
     currentCallUUID = nil
@@ -2714,6 +2908,7 @@ extension SixPagesVoicePlugin: CXProviderDelegate {
     // BUILD 20: report on THIS path, in THIS order, before fulfill(). Not from the
     // controller's completion block. nil == now, which is honest here: we ARE beginning
     // to connect at this instant.
+    ckMark("perform")   // BUILD 22: the action REACHED us. CallKit is alive and talking.
     provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: nil)
 
     action.fulfill()
@@ -2721,6 +2916,7 @@ extension SixPagesVoicePlugin: CXProviderDelegate {
 
   /// The user (or we) ended the call. Stop the audio; do not re-request an end.
   public func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    ckMark("endCall")   // BUILD 22: SOMEONE HUNG UP. Us, iOS, or the car.
     os_log("CallKit: CXEndCallAction performed",
            log: SixPagesVoicePlugin.log, type: .info)
     callKitState = "ended"
@@ -2738,6 +2934,7 @@ extension SixPagesVoicePlugin: CXProviderDelegate {
   /// If this never fires, ckActivates=0 on the strip and NO AUDIO EVER STARTS. That is the
   /// known first-launch bug, and it is the first thing to check if the desk test is silent.
   public func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+    ckMark("ACTIVATE")   // BUILD 22: THE MOMENT WE HAVE NEVER ONCE REACHED IN 5 BUILDS.
     callKitActivateCount += 1
     callKitState = "active"
     os_log("CallKit: didActivate -- session live at CALL priority. Starting audio.",
@@ -2747,6 +2944,7 @@ extension SixPagesVoicePlugin: CXProviderDelegate {
 
   /// iOS deactivated the session. The call is over; the audio engine goes with it.
   public func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+    ckMark("deactivate")   // BUILD 22: the system took the session away.
     os_log("CallKit: didDeactivate -- stopping audio",
            log: SixPagesVoicePlugin.log, type: .info)
     endAudio()
