@@ -8,6 +8,8 @@ Full-duplex, echo-cancelled, low-latency voice — on the phone speaker, on wire
 
 Originally developed for [Six Pages](https://thesixpages.app), a trauma-informed voice and writing companion. Extracted and open-sourced because the infrastructure shouldn't have to be rebuilt by the next person.
 
+**[Why this exists](#why-this-exists)** · **[Architecture](#architecture)** · **[Features](#features)** · **[Install](#install)** · **[Usage](#usage)** · **[iOS setup](#ios-setup--required)** · **[Android setup](#android-setup)** · **[The car bug](#the-car-bug)** · **[Diagnostics](#diagnostics)** · **[Common issues](#common-issues)**
+
 ---
 
 ## Why this exists
@@ -19,6 +21,52 @@ Very few do **all of them at once, in both directions, without the AI hearing it
 That last part is the hard part. A conversation isn't a recording followed by a playback. It's both, continuously, with the microphone open while the speaker is talking, and something has to cancel the echo or the AI transcribes its own voice and answers itself.
 
 This plugin is the missing bridge between Flutter and streaming conversational AI (ElevenLabs, or anything else that speaks and listens in real time).
+
+---
+
+## Architecture
+
+This plugin is the two ends of the loop — everything above the dashed line and everything below it. What happens in between is yours.
+
+```
+              Microphone
+                  │
+                  ▼
+   ┌──────────────────────────────┐
+   │  Acoustic echo cancellation  │   iOS:     VoiceProcessingIO
+   │                              │   Android: WebRTC AEC3
+   └──────────────────────────────┘
+                  │
+                  ▼
+           voice.captureStream          ← PCM16, 16 kHz, mono, 640-byte frames
+                  │
+- - - - - - - - - ┼ - - - - - - - - - - - - - - - - - - - -   your code
+                  │
+                  ▼
+          Speech-to-text  →  LLM  →  Text-to-speech
+                  │
+- - - - - - - - - ┼ - - - - - - - - - - - - - - - - - - - -   plugin again
+                  │
+                  ▼
+         voice.feedPlayback()           ← raw PCM16 in, no resampling needed
+                  │
+                  ▼
+   ┌──────────────────────────────┐
+   │   Lock-free SPSC ring        │   180 s of capacity, because TTS
+   │   180 s (5,760,000 bytes)    │   arrives faster than real time
+   └──────────────────────────────┘
+                  │
+                  ▼
+   ┌──────────────────────────────┐
+   │   Route selection            │   car (HFP) · headset · wired
+   │                              │   USB · speaker
+   └──────────────────────────────┘
+                  │
+                  ▼
+                Output
+```
+
+The far-end signal is fed back into the canceller, which is why the AI does not transcribe itself while it is speaking.
 
 ---
 
@@ -92,6 +140,8 @@ await voice.stop();
 ```
 
 **`start()` is genuinely asynchronous on iOS.** It does not resolve until the system has activated the audio session and the audio unit is running. When it returns `true`, the engine is live and it is safe to feed playback. If it returns `false`, the session did not open — do not feed it. (There is a 4-second internal deadline, so a failure fails loudly rather than hanging forever.)
+
+A runnable demo lives in [`example/`](example/lib/main.dart).
 
 ---
 
@@ -214,7 +264,7 @@ Step 6 was missing for six builds. iOS said so, in plain English, every single t
 
 ## Diagnostics
 
-The plugin exposes a single-line diagnostic strip over the method channel (`getDiagnostics`). It is not yet in the Dart facade — invoke the channel directly. It is the single most valuable thing in this repository.
+The plugin maintains a single-line diagnostic strip that makes failures legible. It is the single most valuable thing in this repository.
 
 A healthy automotive run:
 
@@ -242,6 +292,12 @@ How to read it:
 
 **Counter-intuitive, and it cost three wrong fixes:** low underruns *plus* an audio problem means **overflow**, not starvation. Streaming TTS delivers a turn *faster than real time*, while the render callback drains at natural speech rate. The producer outruns the drain, always. Adding buffer depth or a re-buffering gate **pauses the drain** and makes it worse. Check `droppedBytes` first.
 
+**Read the strip before you tear down the session.** Teardown clears the ring and resets the primed flag; a strip captured after the conversation has ended tells you nothing about the conversation.
+
+> ### Engineering principle
+>
+> **If you cannot read what the platform is telling you, stop fixing and build the instrument first.**
+
 ---
 
 ## Common issues
@@ -268,8 +324,8 @@ AEC is not receiving the far-end signal. On Android, AEC3 needs *both* sides fed
 
 ## Roadmap
 
-- [ ] Expose `getDiagnostics` in the Dart facade
-- [ ] Example application
+- [ ] Expose the diagnostic strip over the method channel and in the Dart facade
+- [x] Example application
 - [ ] API documentation
 - [ ] pub.dev release
 - [ ] Configurable sample rate (currently fixed at 16 kHz mono)
@@ -286,8 +342,6 @@ WebRTC AEC3 is vendored from the WebRTC project. Copyright is retained by Google
 Thanks to [Stuart Gardoll](https://github.com/sgardoll) for the ElevenLabs Flutter library.
 
 This plugin was debugged **entirely from Windows** — no Mac, no Xcode, no Instruments, no Console. Every iOS diagnosis had to come back over a single line of text rendered inside the app. That constraint is why the diagnostic strip exists, and the strip is why the bugs were findable at all.
-
-If you cannot read what the platform is telling you, stop fixing and build the instrument first.
 
 ---
 
