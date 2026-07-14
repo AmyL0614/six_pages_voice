@@ -1,7 +1,16 @@
 name: six_pages_voice
-description: "A new Flutter plugin project."
-version: 0.0.1
-homepage:
+description: "Real-time conversational AI voice for Flutter: full-duplex streaming with native acoustic echo cancellation, Bluetooth HFP, and automotive (car) support on Android and iOS."
+version: 0.1.0
+homepage: https://github.com/AmyL0614/six_pages_voice
+repository: https://github.com/AmyL0614/six_pages_voice
+issue_tracker: https://github.com/AmyL0614/six_pages_voice/issues
+
+topics:
+  - audio
+  - voice
+  - echo-cancellation
+  - bluetooth
+  - conversational-ai
 
 environment:
   sdk: ^3.5.0
