@@ -9,6 +9,57 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
+// BUILD 20: THE CALL WAS REPORTED FROM THE WRONG PLACE. ONE VARIABLE.
+//
+// Build 19 was the right architecture. Build 19b fixed the Dart contract it broke. Both
+// were still DEAD -- the Talk button reported "no session started" and ckActivates=0,
+// meaning provider(_:didActivate:) NEVER FIRED and the VPIO unit was never built.
+//
+// THE BUG WAS NOT MISSING -- IT WAS MISPLACED. reportOutgoingCall() was being called
+// from inside the CXCallController.request COMPLETION BLOCK in requestStartCall(). That
+// is a SECOND, INDEPENDENT ASYNC PATH racing provider(_:perform: CXStartCallAction), and
+// NOTHING ORDERS THEM. reportOutgoingCall(connectedAt:) could land BEFORE the action was
+// fulfilled -- declaring a call CONNECTED that the provider did not yet consider live.
+// The transaction never reached a state the system would elevate. No elevation, no
+// didActivate. No didActivate, no audio. Dead button.
+//
+// Compounding it: startedConnectingAt: nil and connectedAt: nil were fired BACK TO BACK.
+// nil means NOW. We declared "connecting" and "connected" in the same instant, from a
+// completion block, before a single sample of audio existed.
+//
+// THE CORRECT SEQUENCE -- this is what every reference CallKit integration does, and the
+// order is the whole point:
+//
+//     1. requestStartCall()                    CXStartCallAction -> CXTransaction
+//     2. provider(_:perform: CXStartCallAction)
+//            reportOutgoingCall(startedConnectingAt:)   <- BUILD 20: MOVED HERE
+//            action.fulfill()                            <- fulfill AFTER reporting
+//     3. [system elevates the session to CALL priority]
+//     4. provider(_:didActivate:) -> beginAudio()
+//            buildAndStartUnit()                         <- audio is REAL now
+//            reportOutgoingCall(connectedAt:)            <- BUILD 20: MOVED HERE
+//            resolveStart(true)                          <- and NOW Dart is answered
+//
+// "Connected" now means what the word means: the VPIO unit is running and audio is
+// flowing. Not "a completion block returned without an error."
+//
+// The CXCallController completion handler now has exactly ONE job: notice a REFUSED call.
+//
+// WHAT DID NOT CHANGE: the CallKit architecture itself (Build 19), the async start seam
+// and 4s deadman (Build 19b), setPreferredInput (Build 17), the 180s ring (Build 11).
+// setActive(true) is STILL absent from the entire file. NOTHING IN DART CHANGED.
+//
+// voip BACKGROUND MODE: NOT ADDED, DELIBERATELY. It is chiefly required for VoIP PUSH
+// wake-up and receiving calls in the background. This call is user-initiated in the
+// foreground. It was the previous session's hypothesis; it is not the first variable to
+// move, and editing FlutterFlow's locked Info.plist is the highest-risk edit available.
+// If Build 20 comes back with ckActivates=0 STILL, that is when voip earns its turn.
+//
+// READ THE STRIP: ckActivates=1 means this fix landed. ckActivates=0 means it did not,
+// and NO OTHER NUMBER ON THE STRIP MEANS ANYTHING.
+//
+// ───────────────────────────────────────────────────────────────────────────
+//
 // BUILD 19: CALLKIT. NOBODY WAS HANGING UP -- NOBODY EVER PICKED UP.
 //
 // BUILD 18 CAME BACK CASE A, AND IT WAS DECISIVE:
@@ -1009,12 +1060,29 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       os_log("CallKit: call requested -- waiting for didActivate",
              log: SixPagesVoicePlugin.log, type: .info)
 
-      // Tell the system the call CONNECTED. Without this the CallKit UI sits on
-      // "connecting..." forever and some head units never settle their HFP state.
-      if let provider = self.callProvider {
-        provider.reportOutgoingCall(with: uuid, startedConnectingAt: nil)
-        provider.reportOutgoingCall(with: uuid, connectedAt: nil)
-      }
+      // ╔═══════════════════════════════════════════════════════════════════════╗
+      // ║ BUILD 20: reportOutgoingCall() IS GONE FROM HERE. THIS WAS THE BUG.  ║
+      // ╚═══════════════════════════════════════════════════════════════════════╝
+      //
+      // Build 19b reported the call FROM THIS COMPLETION BLOCK. That is a second,
+      // INDEPENDENT async path racing provider(_:perform: CXStartCallAction), and
+      // nothing orders them. reportOutgoingCall(connectedAt:) could therefore land
+      // BEFORE the action was fulfilled -- i.e. we told CallKit the call had already
+      // connected on a call the provider did not yet consider live. The transaction
+      // never reached a state the system would elevate, so provider(_:didActivate:)
+      // NEVER FIRED, the VPIO unit was never built, the 4s deadman resolved false,
+      // and the Talk button was dead. ckActivates=0.
+      //
+      // It was also reporting startedConnectingAt: nil and connectedAt: nil back to
+      // back. nil means NOW. We were declaring "connecting" and "connected" in the
+      // same instant, before any audio existed. That is not the lifecycle CallKit
+      // models and it is not what the call's duration timer is for.
+      //
+      // The reporting now lives where every Apple-sanctioned reference puts it:
+      //   startedConnectingAt -> provider(_:perform: CXStartCallAction), before fulfill()
+      //   connectedAt         -> beginAudio(), AFTER didActivate, when audio is REAL
+      //
+      // This completion handler now does exactly one job: notice a REFUSED call.
     }
   }
 
@@ -1963,6 +2031,24 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       try buildAndStartUnit()
       os_log("beginAudio: VPIO unit running at CALL priority",
              log: SixPagesVoicePlugin.log, type: .info)
+
+      // ╔═══════════════════════════════════════════════════════════════════════╗
+      // ║ BUILD 20: THE CALL IS *CONNECTED* HERE. NOT ONE INSTRUCTION EARLIER.  ║
+      // ╚═══════════════════════════════════════════════════════════════════════╝
+      //
+      // buildAndStartUnit() has returned, so the VPIO unit is running and audio is
+      // genuinely flowing in both directions. THAT is what "connected" means. Build 19b
+      // claimed it from a completion block before any audio existed at all.
+      //
+      // This is also what settles the CallKit UI off "connecting..." and starts the call
+      // duration timer -- and, per the Build 19 theory, what the car's HFP state machine
+      // is waiting to be told.
+      if let provider = self.callProvider, let uuid = self.currentCallUUID {
+        provider.reportOutgoingCall(with: uuid, connectedAt: nil)
+        os_log("CallKit: reported CONNECTED -- audio is live",
+               log: SixPagesVoicePlugin.log, type: .info)
+      }
+
       // BUILD 19b: NOW, and only now, is the engine actually running. THIS is the moment
       // Dart's `await _voice.start()` was always waiting for. Honor the old contract.
       resolveStart(true)
@@ -2500,12 +2586,30 @@ extension SixPagesVoicePlugin: CXProviderDelegate {
   }
 
   /// Our CXStartCallAction is being performed. Apple: CONFIGURE the session here, do NOT
-  /// activate it. We already configured it in startUnit() (ahead of the call, which is
-  /// Apple's own workaround for the first-launch didActivate bug), so there is genuinely
-  /// nothing to do but fulfill.
+  /// activate it, and do NOT start call audio here -- audio may only begin once the system
+  /// has activated the session at elevated priority in didActivate. We already configured
+  /// the session in startUnit() (ahead of the call, which is Apple's own workaround for the
+  /// first-launch didActivate bug), so there is nothing left to configure.
+  ///
+  /// BUILD 20: BUT THERE IS SOMETHING LEFT TO REPORT, AND ITS ABSENCE IS WHY 19b WAS DEAD.
+  ///
+  /// The outgoing call MUST be reported as connecting from INSIDE this delegate method,
+  /// BEFORE fulfill(). Build 19b fulfilled bare and reported from the CXCallController
+  /// completion block instead -- a separate async path with no ordering guarantee against
+  /// this one. The call could be reported connected before it was fulfilled, the system
+  /// never elevated the session, and provider(_:didActivate:) never fired.
+  ///
+  /// The order below is the one every reference CallKit implementation uses:
+  ///     report startedConnecting  ->  fulfill  ->  (system elevates)  ->  didActivate
   public func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
-    os_log("CallKit: CXStartCallAction performed",
+    os_log("CallKit: CXStartCallAction performed -- reporting connecting, then fulfilling",
            log: SixPagesVoicePlugin.log, type: .info)
+
+    // BUILD 20: report on THIS path, in THIS order, before fulfill(). Not from the
+    // controller's completion block. nil == now, which is honest here: we ARE beginning
+    // to connect at this instant.
+    provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: nil)
+
     action.fulfill()
   }
 
