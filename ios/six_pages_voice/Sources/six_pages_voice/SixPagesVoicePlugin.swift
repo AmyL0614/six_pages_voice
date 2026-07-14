@@ -9,6 +9,58 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
+// BUILD 21: THE PLUGIN INSTANCE WAS DEAD. FOUR BUILDS DIED ON TOP OF IT.
+//
+// Builds 19, 19a, 19b and 20 ALL came back "no session started" on the bare iPad, with
+// callKit=none and ckActivates=0. The CallKit architecture (19) was right. The Dart async
+// contract (19b) was right. The reportOutgoingCall ordering (20) was right. NONE OF THEM
+// EVER RAN, because the object they lived on was deallocated before it could be called.
+//
+//     register(with:) did:   let instance = SixPagesVoicePlugin()   <- LOCAL let
+//
+// addMethodCallDelegate() and setStreamHandler() BOTH take their delegate WEAKLY -- that
+// is the Cocoa delegation convention, to avoid retain cycles. Nobody held a strong
+// reference. ARC destroyed the plugin the instant register() returned.
+//
+// WHY IT NEVER MATTERED BEFORE: for eighteen builds every path was SYNCHRONOUS. handle()
+// ran, startUnit() built the unit, result() fired -- all inside ONE method invocation,
+// while Flutter held the object alive. NOTHING EVER NEEDED TO SURVIVE PAST THE END OF A
+// METHOD CALL, so a dangling instance was completely invisible.
+//
+// BUILD 19 MADE THE PLUGIN ASYNCHRONOUS. Asynchronous means the object must still be
+// there LATER. CXProvider holds its delegate WEAKLY; a dead delegate can never receive
+// provider(didActivate:). The controller.request { [weak self] } completion block's
+// `guard let self` FAILED -- which is precisely why callKitState never even advanced to
+// "requested".
+//
+// THE STRIP SAID callKit=none AND THAT WAS THE ANSWER. Not a refused call. A DEAD OBJECT.
+// The call was never refused because the call was never made, because there was nobody
+// left to make it.
+//
+// THE FIX: one static strong reference, held for the life of the process.
+//
+//     private static var retainedInstance: SixPagesVoicePlugin?
+//
+// This is what every Flutter plugin with async callbacks does, and it is what CallKit's
+// own "only create one instance of CXProvider" guidance already assumes: one provider, on
+// one long-lived owner. DO NOT REMOVE IT. If it goes, CallKit goes silent again and the
+// button dies with no error at all.
+//
+// THE LESSON, WRITTEN DOWN SO IT IS NOT RE-LEARNED: when a system goes from SYNCHRONOUS
+// to ASYNCHRONOUS, object LIFETIME becomes load-bearing for the first time. Every latent
+// lifetime bug that was harmless under synchrony becomes fatal under callbacks. The bug
+// was eighteen builds old and only Build 19 could ever have exposed it.
+//
+// NOTHING ELSE MOVED. Build 20's ordering stands (and NOW IT WILL ACTUALLY RUN). CallKit
+// architecture (19), async start seam + 4s deadman (19b), setPreferredInput (17), 180s
+// ring (11) all intact. setActive(true) still absent from the entire file. NOTHING IN
+// DART CHANGED. Android untouched.
+//
+// READ THE STRIP: callKit=requested or active means the object LIVED and the call was
+// made. callKit=none means it is STILL dead and nothing else on the strip means anything.
+//
+// ───────────────────────────────────────────────────────────────────────────
+//
 // BUILD 20: THE CALL WAS REPORTED FROM THE WRONG PLACE. ONE VARIABLE.
 //
 // Build 19 was the right architecture. Build 19b fixed the Dart contract it broke. Both
@@ -1237,16 +1289,70 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // bus is 16 kHz and VoiceProcessingIO resamples 16k→hardware internally.
   private var hwRate: Double = SixPagesVoicePlugin.targetSampleRate
 
+  // ╔═════════════════════════════════════════════════════════════════════════════╗
+  // ║ BUILD 21: THE PLUGIN INSTANCE WAS BEING DEALLOCATED. THIS IS THE BUG.       ║
+  // ╚═════════════════════════════════════════════════════════════════════════════╝
+  //
+  // Builds 19, 19a, 19b and 20 were ALL dead on the iPad -- callKit=none, ckActivates=0,
+  // "no session started." Four builds. The CallKit architecture was correct. Build 20's
+  // reportOutgoingCall ordering was correct. Neither of them ever RAN, because the object
+  // they lived on WAS ALREADY GONE.
+  //
+  // register(with:) did this:
+  //
+  //     let instance = SixPagesVoicePlugin()          <- a LOCAL let
+  //     registrar.addMethodCallDelegate(instance, ...) <- takes its delegate WEAKLY
+  //     captureChannel.setStreamHandler(instance)      <- takes its handler WEAKLY
+  //
+  // NOBODY held a strong reference. Delegation across Cocoa is weak by convention, to
+  // avoid retain cycles -- a weak reference does not keep a strong hold and does not stop
+  // ARC from deallocating. So the plugin was destroyed the instant register() returned.
+  //
+  // WHY EIGHTEEN BUILDS NEVER NOTICED: every path was SYNCHRONOUS. handle() ran,
+  // startUnit() built the unit, result(true) fired -- all inside ONE method invocation,
+  // during which Flutter held the object alive. Nothing ever needed to SURVIVE past the
+  // end of a method call, so a dangling instance was invisible.
+  //
+  // CALLKIT IS ASYNCHRONOUS, AND ASYNCHRONOUS REQUIRES THE OBJECT TO STILL EXIST LATER:
+  //   * CXProvider.setDelegate(self, queue:) holds its delegate WEAKLY. Dead delegate =
+  //     provider(didActivate:) can NEVER be called. There is nothing to call it on.
+  //   * controller.request { [weak self] ... } -- `guard let self` FAILS, which is exactly
+  //     why callKitState never even reached "requested". THE STRIP SAID callKit=none AND
+  //     THAT WAS THE TELL: not a refused call -- a DEAD OBJECT.
+  //   * callProvider and callController are STORED PROPERTIES on that instance. They died
+  //     with it.
+  //
+  // CXProvider.init(configuration:) opens an XPC connection to callservicesd on a
+  // secondary thread and calls back later, from out of process. CallKit is fundamentally
+  // callback-driven. Nothing else in this plugin ever was.
+  //
+  // THE FIX, ONE LINE: hold the instance for the life of the process. This is what every
+  // Flutter plugin with asynchronous callbacks does, and it is what CallKit's own "only
+  // create one instance of CXProvider" guidance already implies -- one provider, on one
+  // long-lived owner.
+  //
+  // DO NOT REMOVE THIS. If it goes, CallKit goes silent again and the button dies with no
+  // error, exactly as it did for four builds.
+  private static var retainedInstance: SixPagesVoicePlugin?
+
   public static func register(with registrar: FlutterPluginRegistrar) {
     let messenger = registrar.messenger()
     let controlChannel = FlutterMethodChannel(
       name: "six_pages_voice/control", binaryMessenger: messenger)
     let captureChannel = FlutterEventChannel(
       name: "six_pages_voice/capture", binaryMessenger: messenger)
+
     let instance = SixPagesVoicePlugin()
+
+    // BUILD 21: THE STRONG REFERENCE. Everything below this line takes `instance` WEAKLY.
+    // Without this, `instance` is deallocated the moment this method returns and CallKit
+    // has no delegate to call back into.
+    SixPagesVoicePlugin.retainedInstance = instance
+
     registrar.addMethodCallDelegate(instance, channel: controlChannel)
     captureChannel.setStreamHandler(instance)
-    os_log("register: control + capture channels registered", log: log, type: .info)
+    os_log("register: control + capture channels registered (instance retained)",
+           log: log, type: .info)
   }
 
   // MARK: - MethodChannel (control)
