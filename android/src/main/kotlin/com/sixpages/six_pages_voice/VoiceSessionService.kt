@@ -14,6 +14,7 @@ import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.telecom.CallAttributesCompat
 import androidx.core.telecom.CallControlResult
+import androidx.core.telecom.CallEndpointCompat
 import androidx.core.telecom.CallsManager
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
@@ -259,25 +260,79 @@ class VoiceSessionService : LifecycleService() {
                         }
                     }
 
-                    // ENDPOINT COLLECTORS — LOG-ONLY BY DESIGN (2B: full trust).
-                    // These LOG what Telecom offers and what it routes to, and do
-                    // NOT call requestEndpointChange. This is deliberate: every time
-                    // this project forced a route (setCommunicationDevice, iOS route
-                    // re-assertion, Android habits on iOS) it broke. In 2A Telecom
-                    // auto-took the car with no steering from us. So 2B trusts the
-                    // library's own routing entirely — wired > BT/car > speaker, with
-                    // earpiece last — and only observes. If a car log later shows the
-                    // library's default diverging from what we want, we add the single
-                    // minimal nudge THEN, targeted from real endpoint data — not before.
+                    // ENDPOINT COLLECTORS — OBSERVE + ONE SURGICAL NUDGE (Option A).
+                    // Full trust remains the rule: we do NOT force a route on every
+                    // update, we do NOT fight the framework, and we NEVER override the
+                    // car or a wired headset. Telecom's default (wired > BT/car >
+                    // speaker > earpiece) stands — with ONE exception.
+                    //
+                    // The exception, confirmed from real device logs: untethered, with
+                    // nothing connected, Telecom's default rests on EARPIECE. In-app,
+                    // Six Pages is a hands-down companion conversation (phone on the
+                    // table), so speaker is the right default there — not earpiece,
+                    // which implies holding the phone to your face like a call. So:
+                    //
+                    //   IF the current endpoint is EARPIECE
+                    //   AND no wired headset and no Bluetooth/car endpoint is available
+                    //   AND we have not already nudged this session
+                    //   THEN request speaker — ONCE — through Telecom's own sanctioned
+                    //        requestEndpointChange API (not setCommunicationDevice).
+                    //
+                    // When the car (Uconnect) or a wired headset is present, the current
+                    // endpoint is NOT earpiece, so the nudge does not fire and the car /
+                    // headset is respected. The one-shot flag prevents any loop (our own
+                    // change re-fires the collector) and prevents us from fighting a
+                    // later manual choice (the future in-app speaker/earpiece toggle).
+                    var latestEndpoints: List<CallEndpointCompat> = emptyList()
+                    var nudgedToSpeaker = false
+
+                    fun maybeNudgeToSpeaker(current: CallEndpointCompat) {
+                        if (nudgedToSpeaker) return
+                        if (current.type != CallEndpointCompat.TYPE_EARPIECE) return
+
+                        val hasWired = latestEndpoints.any {
+                            it.type == CallEndpointCompat.TYPE_WIRED_HEADSET
+                        }
+                        val hasBluetooth = latestEndpoints.any {
+                            it.type == CallEndpointCompat.TYPE_BLUETOOTH
+                        }
+                        if (hasWired || hasBluetooth) {
+                            // A better, user-chosen or car route exists — respect it,
+                            // do not nudge. (This is the branch that protects the car.)
+                            return
+                        }
+
+                        val speaker = latestEndpoints.firstOrNull {
+                            it.type == CallEndpointCompat.TYPE_SPEAKER
+                        }
+                        if (speaker == null) {
+                            Log.i(TAG, "2B-nudge: on earpiece, nothing better, but no SPEAKER endpoint offered — leaving as-is")
+                            return
+                        }
+
+                        nudgedToSpeaker = true
+                        Log.i(TAG, "2B-nudge: in-app default earpiece -> requesting SPEAKER (${speaker.name})")
+                        launch {
+                            when (val r = requestEndpointChange(speaker)) {
+                                is CallControlResult.Success ->
+                                    Log.i(TAG, "2B-nudge: requestEndpointChange(SPEAKER) OK")
+                                is CallControlResult.Error ->
+                                    Log.e(TAG, "2B-nudge: requestEndpointChange(SPEAKER) FAILED code=${r.errorCode}")
+                            }
+                        }
+                    }
+
                     launch {
-                        currentCallEndpoint.collect { ep ->
-                            Log.i(TAG, "TELECOM_2A: currentEndpoint=${ep.name} type=${ep.type}")
+                        availableEndpoints.collect { eps ->
+                            latestEndpoints = eps
+                            val list = eps.joinToString(", ") { "${it.name}(type=${it.type})" }
+                            Log.i(TAG, "TELECOM_2A: availableEndpoints=[$list]")
                         }
                     }
                     launch {
-                        availableEndpoints.collect { eps ->
-                            val list = eps.joinToString(", ") { "${it.name}(type=${it.type})" }
-                            Log.i(TAG, "TELECOM_2A: availableEndpoints=[$list]")
+                        currentCallEndpoint.collect { ep ->
+                            Log.i(TAG, "TELECOM_2A: currentEndpoint=${ep.name} type=${ep.type}")
+                            maybeNudgeToSpeaker(ep)
                         }
                     }
                     launch {
