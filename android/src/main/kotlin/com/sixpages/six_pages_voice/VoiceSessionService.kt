@@ -318,21 +318,27 @@ class VoiceSessionService : LifecycleService() {
     // ────────────────────────────────────────────────────────────────────────
 
     private fun promoteToForeground(notification: Notification) {
-        // On API 34+ the type is enforced; we OR the three types the session needs.
-        // MICROPHONE preserves background mic capture (screen-sleep promise).
-        // PHONE_CALL lets Telecom own the call. CONNECTED_DEVICE covers car/BT.
-        // Promotion happens here from a foreground context (user just tapped Talk),
-        // which is what makes the microphone type legal — re-promoting a mic-typed
-        // FGS from the BACKGROUND is what throws SecurityException, and we never do.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            startForeground(NOTIFICATION_ID, notification, types)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // Android 10-13: microphone type is what legally permits background mic
-            // capture. Telecom on these levels uses ConnectionService for its own
-            // foreground support internally.
+        // FIX (2A crash): promote with MICROPHONE ONLY. We do NOT assert the
+        // phoneCall / connectedDevice foreground types here.
+        //
+        // Why: Core-Telecom's addCall handles the PHONE_CALL foreground promotion
+        // ITSELF — the platform contract is "once a call is added and a notification
+        // is posted, your app is given foreground execution priority and is treated
+        // as a foreground service." Calling startForeground(..., PHONE_CALL) here,
+        // in onStartCommand BEFORE the Telecom call exists, made Android's
+        // validateForegroundServiceType reject the promotion (there is no live call
+        // for the phoneCall type to validate against), which threw and crashed the
+        // app on every session start. The library owns the call foreground; we must
+        // not race it or pre-assert it.
+        //
+        // What we DO need from our own service is the MICROPHONE type: it is what
+        // legally holds mic capture when the screen sleeps (the screen-sleep-keeps-
+        // talking promise). Microphone has no call precondition, so promoting it here
+        // — from a foreground context, the user having just tapped Talk — is legal
+        // and does not throw. The phoneCall/connectedDevice types remain DECLARED in
+        // the manifest (the library needs them declared to do its own promotion), but
+        // WE only pass microphone to startForeground.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
