@@ -107,6 +107,17 @@ project.extensions.configure(org.jetbrains.kotlin.gradle.dsl.KotlinAndroidProjec
 }
 
 dependencies {
+    // Jetpack Core-Telecom. Pinned to the STABLE 1.0.1 release (NOT 1.1.0-alphaNN,
+    // which is Maven's <latest> only because the 1.1.0 feature line is mid-alpha).
+    // 1.0.x went the full alpha -> beta -> rc -> 1.0.0 -> 1.0.1 maturity cycle and
+    // is API-frozen. The whole endpoint API surface we rely on (CallsManager.addCall,
+    // registerAppWithTelecom, CallControlScope, currentCallEndpoint / availableEndpoints,
+    // requestEndpointChange, CallEndpointCompat, CAPABILITY_BASELINE) shipped in the
+    // original 2023 alpha and is present, non-@OptIn, in 1.0.1. CallsManager itself is
+    // @RequiresApi(O / 26), so the Telecom path is gated to API 26+ at the call sites;
+    // API 24-25 continue to run the legacy self-managed audio path unchanged.
+    implementation("androidx.core:core-telecom:1.0.1")
+
     testImplementation("org.jetbrains.kotlin:kotlin-test")
     testImplementation("org.mockito:mockito-core:5.0.0")
 }
