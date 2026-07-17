@@ -3,35 +3,78 @@ package com.sixpages.six_pages_voice
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.telecom.DisconnectCause
 import android.util.Log
+import androidx.annotation.RequiresApi
+import androidx.core.telecom.CallAttributesCompat
+import androidx.core.telecom.CallControlResult
+import androidx.core.telecom.CallsManager
+import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 
 /**
- * VoiceSessionService — keeps a live voice conversation alive when the screen sleeps.
+ * VoiceSessionService — foreground host for a live voice conversation, AND (on
+ * API 26+) the owner of the Android Telecom call that represents that conversation.
  *
- * Two jobs, and they are different:
+ * ───────────────────────────────────────────────────────────────────────────
+ * BUILD 2A — TELECOM CALL LIFECYCLE ONLY. ROUTING NOT YET MIGRATED.
+ * ───────────────────────────────────────────────────────────────────────────
+ * This build stands up the Core-Telecom call and PROVES it can be held on the
+ * device, that the three-type foreground promotes without SecurityException, and
+ * that a remote End Call (car head unit, BT headset, Android Auto) reaches
+ * onSetCallDisconnected and tears the session down.
  *
- *  1. FOREGROUND SERVICE (with microphone type). On Android 14+, an app that is
- *     not in the foreground CANNOT hold the microphone unless it runs a foreground
- *     service typed `microphone`. Without this, Android silently mutes capture the
- *     moment the screen locks — the conversation would look alive and hear nothing.
+ * It deliberately does NOT yet steer audio routing. The plugin's existing
+ * setCommunicationDevice / MODE_IN_COMMUNICATION / audio-focus path still runs
+ * underneath, unchanged. The endpoint collectors below only LOG what Telecom
+ * offers and selects — they do not call requestEndpointChange. Handing routing to
+ * Telecom (and removing the old path) is Build 2B, gated behind the proof that
+ * this build's call lifecycle actually works in the car.
  *
- *  2. PARTIAL WAKELOCK. Keeps the CPU running while allowing the SCREEN to sleep.
- *     PARTIAL_WAKE_LOCK is exactly that contract: screen off, CPU alive. We do NOT
- *     use SCREEN_BRIGHT/FULL wake locks — the user asked to be able to put the phone
- *     down, dark, and keep talking.
+ * Three original jobs of this service are preserved:
  *
- * The persistent notification is not a choice; Android requires one for any
- * foreground service. Wording matches the in-app button the user just pressed
- * ("Talk with Claude") so no new vocabulary is introduced mid-conversation.
+ *  1. FOREGROUND SERVICE. On Android 14+, an app not in the foreground cannot hold
+ *     the microphone unless it runs a typed foreground service. Under Telecom we
+ *     promote with MICROPHONE + CONNECTED_DEVICE + PHONE_CALL together (exactly as
+ *     Google's own Core-Telecom reference app does), because the promotion happens
+ *     from a foreground context (the user just tapped Talk). Keeping the microphone
+ *     type PRESERVES the screen-sleep-keeps-talking promise; adding phoneCall lets
+ *     Telecom own the call; adding connectedDevice covers the car/BT transport.
+ *
+ *  2. PARTIAL WAKELOCK. CPU alive, screen allowed to sleep. Unchanged.
+ *
+ *  3. PERSISTENT NOTIFICATION. Required for any foreground service, and Core-Telecom
+ *     additionally requires a notification within 5 seconds of adding the call.
+ *     One notification serves both. Wording unchanged ("Talking with Claude").
+ *
+ * On API 24-25 (below Core-Telecom's floor of O/26) there is no Telecom call at
+ * all: the service runs exactly as it did before (microphone-typed foreground +
+ * wakelock), and the plugin's legacy audio path owns everything. Those devices do
+ * not get car-hangup support, the same as today.
+ *
+ * PLUGIN <-> SERVICE BRIDGE (minimal, by design):
+ * This service and the plugin communicate through two lightweight signals, sized
+ * for the one-call-per-device reality (each phone ever holds exactly one Joe
+ * conversation — "thousands of users" is thousands of isolated phones, never two
+ * calls in one process):
+ *   - plugin -> service: startForSession() / the disconnect request via
+ *     requestDisconnect(), routed through the action channel into the scope.
+ *   - service -> plugin: onRemoteDisconnect, a @Volatile companion callback the
+ *     plugin arms while a session is live and nulls when idle (mirroring the
+ *     existing carEndCallHandler idiom the raw-API build already proved). A remote
+ *     End Call fires this; a stray event when idle finds null and does nothing.
  */
-class VoiceSessionService : Service() {
+class VoiceSessionService : LifecycleService() {
 
     companion object {
         private const val TAG = "SixPagesVoice"
@@ -42,7 +85,41 @@ class VoiceSessionService : Service() {
         private const val NOTIF_TITLE = "Six Pages"
         private const val NOTIF_BODY = "Talking with Claude"
 
-        fun start(context: Context) {
+        // Voice-adapted call metadata. displayName is what a car head unit / BT
+        // device shows for the call; "Claude" is the companion the user is talking
+        // to. The address is a required non-null tel: URI for the call attributes;
+        // it is never dialed — this is a self-managed VoIP call, not a PSTN call.
+        private const val CALL_DISPLAY_NAME = "Claude"
+        private const val CALL_ADDRESS = "tel:six-pages-voice"
+
+        // SERVICE -> PLUGIN bridge. Armed by the plugin (startEngine) while a
+        // session is live; nulled by the plugin (stopEngine) when idle. A remote
+        // End Call (car / BT / Android Auto) invokes this to trigger plugin
+        // teardown. Null-when-idle is the guard: a stray disconnect after teardown
+        // finds null and does nothing. Mirrors the proven carEndCallHandler pattern.
+        @Volatile
+        var onRemoteDisconnect: (() -> Unit)? = null
+
+        // PLUGIN -> SERVICE control. Set by the plugin before starting the service
+        // so the service knows whether to open a Telecom call (API 26+) or run as a
+        // plain microphone foreground service (API 24-25 / Telecom unavailable).
+        // Read once in onStartCommand.
+        @Volatile
+        private var telecomRequested: Boolean = false
+
+        // Live handle to the running service's disconnect entry point, so the
+        // plugin's stopEngine (Stop button / voice-end) can ask Telecom to
+        // disconnect the call. Set when the call's action loop is ready; nulled
+        // when the call ends. Null means "no live Telecom call to disconnect."
+        @Volatile
+        private var disconnectRequester: (() -> Unit)? = null
+
+        /**
+         * Start the foreground service. [withTelecom] should be true only when the
+         * caller has already confirmed API >= 26; the service re-checks anyway.
+         */
+        fun start(context: Context, withTelecom: Boolean) {
+            telecomRequested = withTelecom
             val intent = Intent(context, VoiceSessionService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -52,34 +129,44 @@ class VoiceSessionService : Service() {
         }
 
         fun stop(context: Context) {
+            // Ask Telecom to disconnect the call first (if one is live), so the
+            // framework and any remote surface (car dashboard) learn the call ended
+            // before the service itself goes away. Safe no-op if no call is live.
+            try {
+                disconnectRequester?.invoke()
+            } catch (e: Exception) {
+                Log.w(TAG, "TELECOM_2A: disconnectRequester threw on stop — ${e.message}")
+            }
             context.stopService(Intent(context, VoiceSessionService::class.java))
         }
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    // The Telecom call's action channel and its scope job. Non-null only while a
+    // call is live. disconnectChannel carries a local disconnect request into the
+    // CallControlScope's select loop.
+    private val disconnectChannel = Channel<Unit>(Channel.CONFLATED)
+    private var callJob: Job? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
         createChannel()
 
         val notification = buildNotification()
-
-        // Android 10+ wants the service type declared at startForeground() too,
-        // not only in the manifest. MICROPHONE is what legally permits background
-        // mic capture on 14+.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
+        promoteToForeground(notification)
 
         acquireWakeLock()
-        Log.i(TAG, "VoiceSessionService started (foreground + partial wakelock)")
+
+        val useTelecom = telecomRequested && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+        Log.i(
+            TAG,
+            "VoiceSessionService started (foreground + wakelock) telecom=$useTelecom sdk=${Build.VERSION.SDK_INT}"
+        )
+
+        if (useTelecom) {
+            startTelecomCall()
+        }
 
         // If Android kills us under memory pressure, do NOT silently resurrect a
         // dead conversation with no socket behind it. The session is owned by the
@@ -88,9 +175,172 @@ class VoiceSessionService : Service() {
     }
 
     override fun onDestroy() {
+        // End the Telecom call cleanly if it is still live, then cancel its scope.
+        try {
+            disconnectChannel.trySend(Unit)
+        } catch (e: Exception) {
+            Log.w(TAG, "TELECOM_2A: disconnectChannel send failed on destroy — ${e.message}")
+        }
+        disconnectRequester = null
+        callJob?.cancel()
+        callJob = null
         releaseWakeLock()
         Log.i(TAG, "VoiceSessionService stopped (wakelock released)")
         super.onDestroy()
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Telecom call (API 26+ only)
+    // ────────────────────────────────────────────────────────────────────────
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun startTelecomCall() {
+        val callsManager = CallsManager(this)
+
+        // CAPABILITY_BASELINE: audio only, no video, no experimental surface.
+        callsManager.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE)
+
+        val attributes = CallAttributesCompat(
+            displayName = CALL_DISPLAY_NAME,
+            address = android.net.Uri.parse(CALL_ADDRESS),
+            direction = CallAttributesCompat.DIRECTION_OUTGOING,
+            callType = CallAttributesCompat.CALL_TYPE_AUDIO_CALL
+        )
+
+        // The call lives on lifecycleScope: bound to this service's lifetime, so it
+        // is automatically cancelled if the service is destroyed. addCall is a
+        // suspend fun that stays suspended for the whole call; the CallControlScope
+        // block is where we drive and observe it.
+        callJob = lifecycleScope.launch {
+            try {
+                callsManager.addCall(
+                    attributes,
+                    onAnswer = { _ ->
+                        // Outgoing self-managed call: no inbound answer path. Present
+                        // to satisfy the callback contract.
+                        Log.i(TAG, "TELECOM_2A: onAnswer (unexpected for outgoing) ")
+                    },
+                    onDisconnect = { cause ->
+                        // REMOTE (or framework) disconnect: car End Call, BT device,
+                        // Android Auto, or the framework itself. Notify the plugin to
+                        // tear down. Keep this fast — we are inside the 5s contract
+                        // window and heavy teardown must not block the lambda.
+                        Log.w(TAG, "TELECOM_2A: onDisconnect cause=${cause.code} -> notifying plugin")
+                        val cb = onRemoteDisconnect
+                        if (cb != null) {
+                            cb.invoke()
+                        } else {
+                            Log.i(TAG, "TELECOM_2A: onDisconnect but no plugin handler armed (idle) ")
+                        }
+                    },
+                    onSetActive = {
+                        Log.i(TAG, "TELECOM_2A: onSetActive")
+                    },
+                    onSetInactive = {
+                        Log.i(TAG, "TELECOM_2A: onSetInactive")
+                    }
+                ) {
+                    // ── Inside CallControlScope (receiver: CoroutineScope) ───────
+                    // block is NOT suspend, but CallControlScope IS a CoroutineScope,
+                    // so every suspend call below runs inside its own launch{}.
+
+                    // Expose a local-disconnect entry point for the plugin's Stop
+                    // button / voice-end path (routed through the select loop below).
+                    disconnectRequester = { disconnectChannel.trySend(Unit) }
+
+                    // Move the call to ACTIVE. This is what tells the platform (and
+                    // the car dashboard) the call is up and running.
+                    launch {
+                        when (val r = setActive()) {
+                            is CallControlResult.Success ->
+                                Log.i(TAG, "TELECOM_2A: setActive OK")
+                            is CallControlResult.Error ->
+                                Log.e(TAG, "TELECOM_2A: setActive FAILED code=${r.errorCode}")
+                        }
+                    }
+
+                    // OBSERVE-ONLY endpoint collectors (2A). These LOG what Telecom
+                    // offers and what it currently routes to. They do NOT call
+                    // requestEndpointChange — routing is still owned by the plugin's
+                    // legacy path in 2A. In 2B these become the steering logic and
+                    // the legacy path is removed. The logs here are the instrument
+                    // that will tell us, in the car, what endpoint model Telecom
+                    // actually exposes on this device before we rely on it.
+                    launch {
+                        currentCallEndpoint.collect { ep ->
+                            Log.i(TAG, "TELECOM_2A: currentEndpoint=${ep.name} type=${ep.type}")
+                        }
+                    }
+                    launch {
+                        availableEndpoints.collect { eps ->
+                            val list = eps.joinToString(", ") { "${it.name}(type=${it.type})" }
+                            Log.i(TAG, "TELECOM_2A: availableEndpoints=[$list]")
+                        }
+                    }
+                    launch {
+                        isMuted.collect { muted ->
+                            Log.i(TAG, "TELECOM_2A: isMuted=$muted")
+                        }
+                    }
+
+                    // Action loop: keep the scope alive and handle a LOCAL disconnect
+                    // request (Stop button / voice-end / service destroy). A REMOTE
+                    // disconnect arrives via the onDisconnect lambda above instead.
+                    launch {
+                        select<Unit> {
+                            disconnectChannel.onReceive {
+                                Log.i(TAG, "TELECOM_2A: local disconnect -> disconnect(LOCAL) ")
+                                val cause = DisconnectCause(DisconnectCause.LOCAL)
+                                when (val r = disconnect(cause)) {
+                                    is CallControlResult.Success ->
+                                        Log.i(TAG, "TELECOM_2A: disconnect OK")
+                                    is CallControlResult.Error ->
+                                        Log.e(TAG, "TELECOM_2A: disconnect FAILED code=${r.errorCode}")
+                                }
+                            }
+                        }
+                        disconnectRequester = null
+                    }
+                }
+            } catch (e: Exception) {
+                // addCall can throw (e.g. registration/permission problems). Log it
+                // loudly for the car test; the plugin's audio path is independent and
+                // is unaffected, so a Telecom failure here degrades to "no car-hangup"
+                // rather than "no audio."
+                Log.e(TAG, "TELECOM_2A: addCall threw — ${e.javaClass.simpleName}: ${e.message}")
+                disconnectRequester = null
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Foreground, wakelock, notification
+    // ────────────────────────────────────────────────────────────────────────
+
+    private fun promoteToForeground(notification: Notification) {
+        // On API 34+ the type is enforced; we OR the three types the session needs.
+        // MICROPHONE preserves background mic capture (screen-sleep promise).
+        // PHONE_CALL lets Telecom own the call. CONNECTED_DEVICE covers car/BT.
+        // Promotion happens here from a foreground context (user just tapped Talk),
+        // which is what makes the microphone type legal — re-promoting a mic-typed
+        // FGS from the BACKGROUND is what throws SecurityException, and we never do.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            startForeground(NOTIFICATION_ID, notification, types)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Android 10-13: microphone type is what legally permits background mic
+            // capture. Telecom on these levels uses ConnectionService for its own
+            // foreground support internally.
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     private fun acquireWakeLock() {

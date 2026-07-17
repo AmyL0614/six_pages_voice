@@ -4,33 +4,35 @@
   <!-- Keeps the CPU alive while the SCREEN sleeps. Partial wakelock only. -->
   <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-  <!-- Foreground service, and its microphone type. On Android 14+ the typed
-       permission is REQUIRED or the mic is silently muted once backgrounded. -->
+  <!-- Foreground service and its typed permissions. On Android 14+ each typed
+       foreground service REQUIRES its matching permission or startForeground
+       throws. This session promotes with three types together (as Google's own
+       Core-Telecom reference app does), so all three permissions are declared:
+         - MICROPHONE  : legally permits background mic capture (screen-sleep).
+         - PHONE_CALL  : lets the Telecom framework own the call.
+         - CONNECTED_DEVICE : covers the car head unit / Bluetooth transport. -->
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
-  <!-- TELECOM DIAGNOSTIC (car hangup instrument). Lets the app register a
-       self-managed VoIP call so the car's End Call button has a Connection to
-       land on. MANAGE_OWN_CALLS is required for Telecom to bind to our
-       ConnectionService. This is instrument-only; no audio behavior. -->
+  <!-- Required by Core-Telecom's CallsManager.addCall (it is annotated
+       @RequiresPermission MANAGE_OWN_CALLS). Lets the app register a self-managed
+       VoIP call so remote surfaces (car head unit, Bluetooth headset, Android Auto)
+       can manage it — most importantly, so the car's End Call button reaches our
+       onDisconnect and tears the session down. -->
   <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
 
   <application>
+    <!-- Foreground host for a live voice conversation AND (API 26+) the owner of
+         the Telecom call. Multiple foreground types are declared; the service
+         selects the right combination at startForeground() based on API level.
+         A LifecycleService is used so the CallControlScope coroutine is bound to
+         the service lifetime. -->
     <service
       android:name=".VoiceSessionService"
-      android:foregroundServiceType="microphone"
+      android:foregroundServiceType="microphone|phoneCall|connectedDevice"
       android:exported="false" />
-
-    <!-- Self-managed ConnectionService. BIND_TELECOM_CONNECTION_SERVICE +
-         the intent-filter are how Telecom discovers and binds to us. -->
-    <service
-      android:name=".CallConnectionService"
-      android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE"
-      android:exported="true">
-      <intent-filter>
-        <action android:name="android.telecom.ConnectionService" />
-      </intent-filter>
-    </service>
   </application>
 
 </manifest>

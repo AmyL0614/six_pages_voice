@@ -123,18 +123,11 @@ class SixPagesVoicePlugin :
             System.loadLibrary("six_pages_voice_aec3")
         }
 
-        // CAR END-CALL TEARDOWN HOOK.
-        // Set to point at stopEngine() while a session is LIVE; cleared to null
-        // when the session ends. The Telecom Connection's onDisconnect() (the car's
-        // End Call button) invokes this. Being null-when-idle is the guard: a stray
-        // onDisconnect after teardown, or any car event with no live session, finds
-        // a null handler and does NOTHING. Only a deliberate End Call during a live
-        // session can tear down. This is why turning the car off does not, by
-        // itself, kill audio: a transport drop arrives on the route path, not here,
-        // and even if the framework did fire onDisconnect spuriously, it can only
-        // act while a session is live — which is exactly when the user meant "end."
-        @Volatile
-        var carEndCallHandler: (() -> Unit)? = null
+        // NOTE (Build 2A): the car End-Call teardown hook that used to live here
+        // (carEndCallHandler) has moved to VoiceSessionService.onRemoteDisconnect,
+        // because the service now owns the Telecom call whose onDisconnect fires it.
+        // The plugin arms that hook in startEngine() and nulls it in stopEngine(),
+        // preserving the same null-when-idle guard.
     }
 
     // AEC3 engine handle (opaque native pointer). 0 == no engine.
@@ -390,37 +383,35 @@ class SixPagesVoicePlugin :
     // --- Engine ---
 
     private fun startEngine(): Boolean {
+        // ── BUILD 2A: TELECOM CALL LIFECYCLE (routing NOT yet migrated) ──────────
+        // The foreground service now ALSO owns the Android Telecom call (on API 26+).
+        // We arm the service->plugin remote-disconnect bridge BEFORE starting the
+        // service, so a remote End Call (car / BT / Android Auto) that fires quickly
+        // finds a live handler. Posted to the main looper because onDisconnect fires
+        // on a binder/main callback and stopEngine touches audio objects that expect
+        // the main looper. The handler is nulled in stopEngine() so it is null while
+        // idle — a stray disconnect after teardown then finds null and does nothing
+        // (mirrors the proven carEndCallHandler guard).
+        VoiceSessionService.onRemoteDisconnect = {
+            mainHandler.post {
+                Log.w(tag, "TELECOM_2A: REMOTE END-CALL -> stopEngine() (deliberate hangup)")
+                stopEngine()
+            }
+        }
+
         // Foreground service FIRST. It must be running before capture begins, or
         // Android 14+ will mute the mic the moment the app backgrounds. It also
-        // holds the partial wakelock that keeps the CPU alive with the screen off.
-        appContext?.let { VoiceSessionService.start(it) }
+        // holds the partial wakelock that keeps the CPU alive with the screen off,
+        // and (API 26+) opens the Telecom call. Telecom is requested only at API 26+
+        // (Core-Telecom's floor); below that the service runs as a plain microphone
+        // foreground service and the legacy audio path owns everything.
+        val useTelecom = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+        appContext?.let { VoiceSessionService.start(it, useTelecom) }
 
-        // TELECOM DIAGNOSTIC (car hangup instrument) — INSTRUMENT ONLY, NO AUDIO.
-        // Registers a self-managed call so the car's End Call button has a
-        // Connection to land on. Wrapped so ANY Telecom failure only logs and the
-        // working audio path below proceeds exactly as it does today. This does
-        // NOT request focus, set a route, or touch MODE_IN_COMMUNICATION. It is
-        // placed here (after the service, before focus) so it cannot reorder the
-        // focus-first sequence the car route depends on.
-        try {
-            appContext?.let {
-                TelecomProbe.ensureRegistered(it)
-                TelecomProbe.placeOutgoing(it)
-            }
-            // Arm the car End-Call teardown hook for THIS live session. The car's
-            // End Call button (Telecom onDisconnect) will invoke this to tear down.
-            // Posted to the main thread because onDisconnect fires on a binder/main
-            // callback and stopEngine touches audio objects that expect the main
-            // looper. Cleared in stopEngine() so it is null whenever idle.
-            carEndCallHandler = {
-                mainHandler.post {
-                    Log.w(tag, "TELECOM_TEST: CAR END-CALL -> stopEngine() (deliberate hangup)")
-                    stopEngine()
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "TELECOM_TEST: probe threw, ignoring (audio unaffected) — ${e.message}")
-        }
+        // NOTE (2A): the legacy routing/focus/mode path below is UNCHANGED and still
+        // owns audio routing. Telecom's endpoint collectors in the service only LOG
+        // in 2A. Handing routing to Telecom and removing this legacy path is 2B,
+        // gated on the car test proving this call lifecycle works.
 
         // FOCUS FIRST, before MODE_IN_COMMUNICATION. That is Google's ordering.
         // Requesting focus AFTER entering communication mode is how a car's Bluetooth
@@ -458,11 +449,13 @@ class SixPagesVoicePlugin :
     }
 
     private fun stopEngine() {
-        // Clear the car End-Call hook FIRST. stopEngine() can be entered via that
-        // hook (car End Call button); nulling it before any teardown makes a second
-        // trigger a no-op and closes any re-entrancy. When idle, the hook is null,
-        // so a stray car event finds nothing to call.
-        carEndCallHandler = null
+        // Clear the remote End-Call bridge FIRST. stopEngine() can be entered via
+        // that hook (car End Call button -> service onDisconnect -> onRemoteDisconnect);
+        // nulling it before any teardown makes a second trigger a no-op and closes any
+        // re-entrancy. When idle, the hook is null, so a stray remote event finds
+        // nothing to call. (Telecom's own disconnect is triggered separately when the
+        // service stops, via its disconnectRequester.)
+        VoiceSessionService.onRemoteDisconnect = null
 
         // A1: freeze the strip BEFORE teardown wipes it. The iOS Hard Rules were
         // written in blood over exactly this: a strip read after stopUnit() is

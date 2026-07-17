@@ -118,6 +118,17 @@ dependencies {
     // API 24-25 continue to run the legacy self-managed audio path unchanged.
     implementation("androidx.core:core-telecom:1.0.1")
 
+    // Core-Telecom's call lives inside a LifecycleService so its CallControlScope
+    // coroutine is bound to the service lifetime (auto-cancelled on destroy).
+    // LifecycleService ships in lifecycle-service; the lifecycleScope extension
+    // ships in lifecycle-runtime-ktx. Neither is guaranteed transitive from
+    // core-telecom, so both are declared explicitly. 2.8.7 is a widely-compatible
+    // stable line; if the app module already pulls a newer lifecycle, Gradle will
+    // resolve upward to the highest requested version (AndroidX enforces matching
+    // lifecycle-* versions via constraints).
+    implementation("androidx.lifecycle:lifecycle-service:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+
     testImplementation("org.jetbrains.kotlin:kotlin-test")
     testImplementation("org.mockito:mockito-core:5.0.0")
 }
