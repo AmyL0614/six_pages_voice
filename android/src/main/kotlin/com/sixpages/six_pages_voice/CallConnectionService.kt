@@ -111,13 +111,32 @@ class CallConnectionService : ConnectionService() {
 
         override fun onDisconnect() {
             // ============================================================
-            // THE LINE WE DROVE TO THE CAR TO SEE.
-            // If this fires after pressing End Call on the head unit, the
-            // wire EXISTS on the SM-S928U and the next build routes it into
-            // stopEngine(). If the car press produces NOTHING here, the
-            // Samsung stack did not deliver the hangup to a self-managed call.
+            // THE CAR'S "END CALL" LANDS HERE. Proven on the SM-S928U.
+            // This is the DELIBERATE-hangup callback: the End Call button.
+            // A transport drop (engine off, Bluetooth out of range) arrives on
+            // the audio-route path, NOT here — so wiring teardown to this
+            // callback ends the session ONLY when the user meant to end it.
+            //
+            // SAFETY GUARD: we call the plugin's teardown hook, which is
+            // non-null ONLY while a session is live. If this somehow fired with
+            // no live session (a stray framework event), the hook is null and
+            // NOTHING happens — the session cannot be killed when idle.
+            //
+            // CAR-TEST READ: if the End Call BUTTON produces this line and the
+            // audio dies, that is the win. If turning the car OFF (without
+            // pressing End Call) ALSO produces this line, the S928U treats a
+            // transport drop as a hangup — we will see it here and add a guard.
             // ============================================================
-            Log.w(TAG, "STAGE 3: onDisconnect FIRED — CAR HANGUP RECEIVED. This is the wire we needed.")
+            Log.w(TAG, "STAGE 3: onDisconnect FIRED — CAR END CALL. Invoking teardown hook.")
+
+            val hook = SixPagesVoicePlugin.carEndCallHandler
+            if (hook != null) {
+                Log.w(TAG, "TELECOM_TEST: teardown hook present -> tearing down session")
+                hook.invoke()
+            } else {
+                Log.w(TAG, "TELECOM_TEST: teardown hook NULL (no live session) -> no-op, audio untouched")
+            }
+
             setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
             destroy()
             activeConnection = null

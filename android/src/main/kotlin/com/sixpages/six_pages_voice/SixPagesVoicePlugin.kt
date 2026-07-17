@@ -122,6 +122,19 @@ class SixPagesVoicePlugin :
         init {
             System.loadLibrary("six_pages_voice_aec3")
         }
+
+        // CAR END-CALL TEARDOWN HOOK.
+        // Set to point at stopEngine() while a session is LIVE; cleared to null
+        // when the session ends. The Telecom Connection's onDisconnect() (the car's
+        // End Call button) invokes this. Being null-when-idle is the guard: a stray
+        // onDisconnect after teardown, or any car event with no live session, finds
+        // a null handler and does NOTHING. Only a deliberate End Call during a live
+        // session can tear down. This is why turning the car off does not, by
+        // itself, kill audio: a transport drop arrives on the route path, not here,
+        // and even if the framework did fire onDisconnect spuriously, it can only
+        // act while a session is live — which is exactly when the user meant "end."
+        @Volatile
+        var carEndCallHandler: (() -> Unit)? = null
     }
 
     // AEC3 engine handle (opaque native pointer). 0 == no engine.
@@ -394,6 +407,17 @@ class SixPagesVoicePlugin :
                 TelecomProbe.ensureRegistered(it)
                 TelecomProbe.placeOutgoing(it)
             }
+            // Arm the car End-Call teardown hook for THIS live session. The car's
+            // End Call button (Telecom onDisconnect) will invoke this to tear down.
+            // Posted to the main thread because onDisconnect fires on a binder/main
+            // callback and stopEngine touches audio objects that expect the main
+            // looper. Cleared in stopEngine() so it is null whenever idle.
+            carEndCallHandler = {
+                mainHandler.post {
+                    Log.w(tag, "TELECOM_TEST: CAR END-CALL -> stopEngine() (deliberate hangup)")
+                    stopEngine()
+                }
+            }
         } catch (e: Exception) {
             Log.e(tag, "TELECOM_TEST: probe threw, ignoring (audio unaffected) — ${e.message}")
         }
@@ -434,6 +458,12 @@ class SixPagesVoicePlugin :
     }
 
     private fun stopEngine() {
+        // Clear the car End-Call hook FIRST. stopEngine() can be entered via that
+        // hook (car End Call button); nulling it before any teardown makes a second
+        // trigger a no-op and closes any re-entrancy. When idle, the hook is null,
+        // so a stray car event finds nothing to call.
+        carEndCallHandler = null
+
         // A1: freeze the strip BEFORE teardown wipes it. The iOS Hard Rules were
         // written in blood over exactly this: a strip read after stopUnit() is
         // meaningless, and we reasoned off one for hours. This is the state at
