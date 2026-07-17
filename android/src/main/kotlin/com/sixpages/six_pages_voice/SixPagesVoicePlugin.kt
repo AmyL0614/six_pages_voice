@@ -514,6 +514,10 @@ class SixPagesVoicePlugin :
     // We do NOT fail the session if focus is denied. A denial is logged and we proceed,
     // so it surfaces in logcat as a DIAGNOSIS instead of a silent no-audio.
     private fun requestFocus(): Boolean {
+        if (telecomOwnsRouting()) {
+            Log.i(tag, "2B: requestFocus() skipped — Telecom owns audio focus (API ${Build.VERSION.SDK_INT})")
+            return true
+        }
         val am = audioManager() ?: return false
 
         val listener = AudioManager.OnAudioFocusChangeListener { change ->
@@ -567,6 +571,7 @@ class SixPagesVoicePlugin :
     }
 
     private fun abandonFocus() {
+        if (telecomOwnsRouting()) return
         val am = audioManager() ?: return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             focusRequest?.let { am.abandonAudioFocusRequest(it) }
@@ -598,8 +603,30 @@ class SixPagesVoicePlugin :
         AudioDeviceInfo.TYPE_BUILTIN_SPEAKER  // default when nothing is attached
     )
 
+    // ── BUILD 2B: TELECOM OWNS ROUTING (API 26+) ────────────────────────────
+    // On API 26+ the Core-Telecom call (in VoiceSessionService) is the sole owner
+    // of audio mode, focus, and route. The legacy path below — MODE_IN_COMMUNICATION,
+    // setCommunicationDevice, audio focus, the AudioDeviceCallback route listener —
+    // must NOT run there, or it fights Telecom for the route (the H1 "ROUTE LOST /
+    // MODE_IN_COMMUNICATION arbitration" war seen in every prior car log). We do not
+    // steer Telecom either: full trust in the library's own routing (it auto-took the
+    // car in 2A). So on 26+ these functions no-op and Telecom drives everything.
+    //
+    // On API 24-25 (below Core-Telecom's floor of O/26) there is NO Telecom call, so
+    // this legacy path remains the ONLY router and runs exactly as before. The guard
+    // is therefore "26+ => Telecom owns it => legacy routing stands down."
+    //
+    // startEngine()/stopEngine() call these functions unconditionally; the guard lives
+    // inside each so the call sequence is unchanged and the pre-26 path is untouched.
+    private fun telecomOwnsRouting(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+
     // Enters communication mode ONCE per session and selects the best route.
     private fun routeToSpeaker() {
+        if (telecomOwnsRouting()) {
+            Log.i(tag, "2B: routeToSpeaker() skipped — Telecom owns routing (API ${Build.VERSION.SDK_INT})")
+            return
+        }
         val am = audioManager() ?: return
         savedAudioMode = am.mode
         am.mode = AudioManager.MODE_IN_COMMUNICATION
@@ -622,6 +649,7 @@ class SixPagesVoicePlugin :
     private fun selectBestRoute() = selectBestRoute("route")
 
     private fun selectBestRoute(why: String) {
+        if (telecomOwnsRouting()) return
         val am = audioManager() ?: return
         routeSelectCount++
 
@@ -866,6 +894,7 @@ class SixPagesVoicePlugin :
     }
 
     private fun clearSpeakerRoute() {
+        if (telecomOwnsRouting()) return
         val am = audioManager() ?: return
         unregisterRouteListener()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {

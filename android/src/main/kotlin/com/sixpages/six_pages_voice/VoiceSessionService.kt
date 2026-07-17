@@ -259,13 +259,16 @@ class VoiceSessionService : LifecycleService() {
                         }
                     }
 
-                    // OBSERVE-ONLY endpoint collectors (2A). These LOG what Telecom
-                    // offers and what it currently routes to. They do NOT call
-                    // requestEndpointChange — routing is still owned by the plugin's
-                    // legacy path in 2A. In 2B these become the steering logic and
-                    // the legacy path is removed. The logs here are the instrument
-                    // that will tell us, in the car, what endpoint model Telecom
-                    // actually exposes on this device before we rely on it.
+                    // ENDPOINT COLLECTORS — LOG-ONLY BY DESIGN (2B: full trust).
+                    // These LOG what Telecom offers and what it routes to, and do
+                    // NOT call requestEndpointChange. This is deliberate: every time
+                    // this project forced a route (setCommunicationDevice, iOS route
+                    // re-assertion, Android habits on iOS) it broke. In 2A Telecom
+                    // auto-took the car with no steering from us. So 2B trusts the
+                    // library's own routing entirely — wired > BT/car > speaker, with
+                    // earpiece last — and only observes. If a car log later shows the
+                    // library's default diverging from what we want, we add the single
+                    // minimal nudge THEN, targeted from real endpoint data — not before.
                     launch {
                         currentCallEndpoint.collect { ep ->
                             Log.i(TAG, "TELECOM_2A: currentEndpoint=${ep.name} type=${ep.type}")
