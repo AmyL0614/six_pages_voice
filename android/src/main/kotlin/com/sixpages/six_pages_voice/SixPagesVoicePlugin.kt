@@ -382,6 +382,22 @@ class SixPagesVoicePlugin :
         // holds the partial wakelock that keeps the CPU alive with the screen off.
         appContext?.let { VoiceSessionService.start(it) }
 
+        // TELECOM DIAGNOSTIC (car hangup instrument) — INSTRUMENT ONLY, NO AUDIO.
+        // Registers a self-managed call so the car's End Call button has a
+        // Connection to land on. Wrapped so ANY Telecom failure only logs and the
+        // working audio path below proceeds exactly as it does today. This does
+        // NOT request focus, set a route, or touch MODE_IN_COMMUNICATION. It is
+        // placed here (after the service, before focus) so it cannot reorder the
+        // focus-first sequence the car route depends on.
+        try {
+            appContext?.let {
+                TelecomProbe.ensureRegistered(it)
+                TelecomProbe.placeOutgoing(it)
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "TELECOM_TEST: probe threw, ignoring (audio unaffected) — ${e.message}")
+        }
+
         // FOCUS FIRST, before MODE_IN_COMMUNICATION. That is Google's ordering.
         // Requesting focus AFTER entering communication mode is how a car's Bluetooth
         // stack beats us to it. Denial is logged, not fatal - see requestFocus().
