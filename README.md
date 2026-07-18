@@ -58,13 +58,15 @@ This plugin is the two ends of the loop — everything above the dashed line and
                   │
                   ▼
    ┌──────────────────────────────┐
-   │   Route selection            │   car (HFP) · headset · wired
-   │                              │   USB · speaker
+   │   Route ownership            │   iOS:     CallKit + VoiceProcessingIO
+   │                              │   Android: Jetpack Core-Telecom
    └──────────────────────────────┘
                   │
                   ▼
                 Output
 ```
+
+On **both** platforms the session is registered as a real call, and the *platform* owns audio routing — the plugin does not drive `setCommunicationDevice` or `overrideOutputAudioPort`. The car, the headset, the speaker: the OS routes to them because it is holding a call, not because the plugin forced a device. That single decision — declare a call, then get out of the way — is what makes cars work and what stopped the routing from fighting itself.
 
 The far-end signal is fed back into the canceller, which is why the AI does not transcribe itself while it is speaking.
 
@@ -76,13 +78,13 @@ The far-end signal is fed back into the canceller, which is why the AI does not 
 - **Native acoustic echo cancellation**
   - Android: WebRTC **AEC3** (software; both far-end and near-end signals fed to it)
   - iOS: **VoiceProcessingIO** (system AEC)
-- **CallKit integration on iOS** — the session is a real call, at call priority. This is what makes cars work.
+- **The session is a real call, on both platforms** — CallKit on iOS, Jetpack Core-Telecom on Android. Registered at call priority, which is what makes cars, headsets, and screen-off survival work.
 - **Bluetooth HFP** — bidirectional, including **automotive** head units
 - **Bluetooth A2DP** — output-only devices (headphones, speakers)
-- **Wired headsets, USB, and speaker**, with automatic priority selection
+- **Wired headsets, USB, and speaker** — the platform selects; the plugin does not override
 - **Lock-free SPSC ring buffer** — 180 seconds of capacity (5,760,000 bytes), so a TTS turn delivered *faster than real time* never overflows
-- **Automatic route following** — audio follows the device the user connects mid-conversation
-- **Survives screen lock** — Android foreground service (`microphone` type) + partial wakelock; iOS background audio
+- **Automatic route following** — audio follows the device the user connects mid-conversation, because the platform owns the route
+- **Survives screen lock** — Android foreground service (`microphone` type) + partial wakelock, alongside the Core-Telecom call; iOS background audio
 - **Rich diagnostics** — a single-line strip that makes failures legible. This is how the car bug was found.
 
 **Audio format:** PCM16, 16 kHz, mono. 640-byte frames (20 ms).
@@ -91,10 +93,10 @@ The far-end signal is fed back into the canceller, which is why the AI does not 
 
 ## Platforms
 
-| Platform | Status | AEC | Bluetooth HFP | Car |
-|---|---|---|---|---|
-| Android | Supported | WebRTC AEC3 | Yes | Proven |
-| iOS | Supported | VoiceProcessingIO | Yes | Proven |
+| Platform | Status | AEC | Call framework | Bluetooth HFP | Car |
+|---|---|---|---|---|---|
+| Android | Supported | WebRTC AEC3 | Jetpack Core-Telecom | Yes | Proven (final routing verification in progress) |
+| iOS | Supported | VoiceProcessingIO | CallKit | Yes | Proven |
 
 ---
 
@@ -215,17 +217,15 @@ On start, the plugin selects the preferred *input* port (for example, the car's 
 
 ## Android setup
 
-Routing is handled internally, with priority selection:
+Android routing is owned by **Jetpack Core-Telecom** (`androidx.core:core-telecom`). The session is registered as a real VoIP call via `CallsManager.addCall`, and from that point the framework owns audio mode, focus, and route. The plugin does **not** call `setCommunicationDevice`, does **not** set `MODE_IN_COMMUNICATION`, and does **not** request audio focus — Google's own guidance is explicit that doing so *while a Telecom call is active* causes audio issues, and it did: it produced a constant route-arbitration war where the framework yanked the route back to the earpiece every few seconds.
 
-```
-Bluetooth SCO → BLE headset → wired headset → wired headphones → USB headset → built-in speaker
-```
+The rule is the same one that makes iOS work: **declare a call, then get out of the way.** Route selection — car, headset, wired, speaker — is the library's job. Audio follows the endpoint the framework hands us, observed through the `availableEndpoints` / `currentCallEndpoint` flows.
 
-Speaker is a **fallback**, never an override — the plugin will not yank audio off a user's headset. `AudioManager.setCommunicationDevice()` is used, with `MODE_IN_COMMUNICATION`.
+**The one nudge.** There is exactly one place the plugin steers, and it is surgical. Telecom's default for an in-app conversation with nothing else connected is the **earpiece** — correct for a phone call, wrong for a hands-down companion conversation. So when (and only when) the *current* endpoint is the earpiece, the plugin makes a single `requestEndpointChange` to the speaker, once, through Telecom's own sanctioned API. It keys on the *current* endpoint, never on what is merely *available* — an idle smartwatch sitting in the endpoint list as a Bluetooth device is not the route and is correctly ignored. When the car or a headset is the active route, the current endpoint is that device, not the earpiece, so the nudge never fires and the car is never stolen from.
 
-**Order matters.** The route must be asserted *after* both streams are live. Starting an audio session in `MODE_IN_COMMUNICATION` silently clobbers the route back to the earpiece, so asserting it too early does nothing at all.
+**API floor.** Core-Telecom's `CallsManager` is `@RequiresApi(O)` — API 26. On **API 26+** the Telecom path above owns everything. On **API 24–25** (below the library's floor) there is no Telecom call; the plugin falls back to the legacy `setCommunicationDevice` / `MODE_IN_COMMUNICATION` path, gated, exactly as it worked before. No device loses voice.
 
-The plugin ships a foreground service (`microphone` type) plus a partial wakelock. On **Android 14+ this is mandatory**: without it the microphone is *silently muted* the moment the app leaves the foreground.
+**The foreground service.** The plugin ships a `LifecycleService` (so the call's coroutine scope is bound to the service lifetime) that promotes to the foreground with the `microphone` type. On **Android 14+ this is mandatory** — without it the microphone is *silently muted* the moment the app leaves the foreground. The service promotes with `microphone` **only**; Core-Telecom handles the `phoneCall` foreground promotion itself once the call is added. (Asserting `phoneCall` in `startForeground` before the call exists makes Android's `validateForegroundServiceType` reject it and crashes the app — the library owns that promotion, not the app.)
 
 The plugin's manifest declares:
 
@@ -233,7 +233,12 @@ The plugin's manifest declares:
 <uses-permission android:name="android.permission.WAKE_LOCK" />
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+<uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
 ```
+
+`MANAGE_OWN_CALLS` is required by `CallsManager.addCall`. The `phoneCall` and `connectedDevice` foreground types are **declared** so the library can promote them; the plugin's own `startForeground` call still passes `microphone` only.
 
 **Your app must declare and request `RECORD_AUDIO` itself**, plus `POST_NOTIFICATIONS` (Android 13+) for the foreground-service notification. The plugin does not request these for you.
 
@@ -245,9 +250,11 @@ Cars are the reason this plugin exists in its current form, and the failure is n
 
 When a car opens a Bluetooth **HFP** channel, its state machine expects to be told a **call is in progress**. Not audio — a *call*. It is waiting for the telephony signal (`+CIEV: call=1`).
 
-If iOS never sends that signal, the head unit concludes the link is dead and tears down the SCO uplink — reliably, at about **five seconds**. Audio falls back to the phone speaker, mid-sentence.
+If the phone never sends that signal, the head unit concludes the link is dead and tears down the SCO uplink — reliably, at about **five seconds**. Audio falls back to the phone speaker, mid-sentence.
 
-The fix is not an audio fix. It is a **declaration**:
+The fix is not an audio fix on either platform. It is a **declaration**: tell the OS a real call is happening, and let the OS carry the telephony signaling and own the route.
+
+**On iOS**, that declaration is CallKit:
 
 1. Declare a real call to iOS via **CallKit** (`CXProvider`, `CXCallController`, `CXStartCallAction`).
 2. Report the call as *connecting* from inside `provider(_:perform: CXStartCallAction)`, **then** fulfill the action.
@@ -260,13 +267,19 @@ Step 6 was missing for six builds. iOS said so, in plain English, every single t
 
 **Retain your plugin instance.** `addMethodCallDelegate` and `setStreamHandler` both hold their delegate *weakly*. That is harmless while everything is synchronous, but CallKit is callback-driven: the object must still exist when `didActivate` fires later. A `static` strong reference in `register(with:)` is required.
 
+**On Android**, that declaration is Jetpack Core-Telecom. `CallsManager.addCall` registers the VoIP call and the framework does the same job CallKit does on iOS: it holds the call, carries the telephony signaling to the head unit, and owns the route. The car's **End Call** button reaches the app through the `onDisconnect` lambda — a remote surface (head unit, Bluetooth headset, Android Auto) controlling a real call, which is only possible because the OS knows it *is* a call.
+
+This is the same lesson on both platforms, and it is worth stating plainly: **the earlier Android approach tried to drive the route by hand (`setCommunicationDevice` under `MODE_IN_COMMUNICATION`) and lost.** It lost the same way an iOS app loses when it activates its own audio session — it was fighting the system for something the system will only give to a declared call. Declaring the call, on both platforms, is what stopped the fight.
+
 ---
 
 ## Diagnostics
 
 The plugin maintains a single-line diagnostic strip that makes failures legible. It is the single most valuable thing in this repository.
 
-A healthy automotive run:
+The strip below is the **iOS** one — CallKit-centric, read back over the method channel because iOS has no console you can reach from Windows. **Android** exposes the equivalent through `logcat` (filter to `SixPagesVoice`): the same discipline — capture state at the moment of a failure — applied to the platform you can actually `adb` into. On the Telecom path, watch `availableEndpoints` / `currentEndpoint` (what the framework offers and routes to) and the `2B-nudge` lines (the one speaker steer), the way you watch `ckTrail` on iOS.
+
+A healthy automotive run (iOS):
 
 ```
 callKit=active; ckActivates=1;
@@ -310,6 +323,15 @@ Same check. `callKit=none` is ambiguous on its own — read `ckTrail` to disting
 
 **Microphone silently dies when backgrounded (Android 14+).**
 You need a foreground service of type `microphone`. The plugin ships one — make sure `RECORD_AUDIO` and `POST_NOTIFICATIONS` are granted.
+
+**App crashes instantly on session start (Android 14+).**
+`validateForegroundServiceType` is rejecting a `phoneCall` foreground promotion made before a Telecom call exists. Do not pass `FOREGROUND_SERVICE_TYPE_PHONE_CALL` to your own `startForeground` — Core-Telecom promotes the call foreground itself. Promote with `microphone` only.
+
+**Audio keeps snapping back to the earpiece; the route fights itself (Android).**
+You are driving `setCommunicationDevice` / `MODE_IN_COMMUNICATION` while a Telecom call is active. Don't — the framework owns the route for a declared call, and it will win the arbitration every time. Observe `availableEndpoints` / `currentCallEndpoint` and, if you must steer, use `requestEndpointChange`.
+
+**Audio comes up on the earpiece in-app when it should be the speaker (Android).**
+That is Telecom's default for a call with nothing else connected. Nudge to the speaker with a single `requestEndpointChange` keyed on the *current* endpoint being the earpiece — not on what is merely available. An idle smartwatch shows up as an available Bluetooth endpoint and will block a naive "is Bluetooth present" check.
 
 **Playback degrades late in long replies; the tail is missing.**
 Ring overflow. `droppedBytes > 0`. Do **not** add priming depth — that makes it worse.
