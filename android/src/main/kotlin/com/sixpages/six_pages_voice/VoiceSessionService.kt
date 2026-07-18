@@ -288,25 +288,35 @@ class VoiceSessionService : LifecycleService() {
 
                     fun maybeNudgeToSpeaker(current: CallEndpointCompat) {
                         if (nudgedToSpeaker) return
-                        if (current.type != CallEndpointCompat.TYPE_EARPIECE) return
 
-                        val hasWired = latestEndpoints.any {
-                            it.type == CallEndpointCompat.TYPE_WIRED_HEADSET
-                        }
-                        val hasBluetooth = latestEndpoints.any {
-                            it.type == CallEndpointCompat.TYPE_BLUETOOTH
-                        }
-                        if (hasWired || hasBluetooth) {
-                            // A better, user-chosen or car route exists — respect it,
-                            // do not nudge. (This is the branch that protects the car.)
-                            return
-                        }
+                        // The trigger is ONE unambiguous signal: we are CURRENTLY
+                        // resting on the earpiece. Nothing else. We deliberately do
+                        // NOT look at what is merely *available*.
+                        //
+                        // Why (proven by a controlled device test, 2026-07-17):
+                        // an earlier version blocked this nudge whenever ANY Bluetooth
+                        // endpoint was *available*. But a passive smartwatch (Garmin
+                        // Venu, Galaxy Watch, etc.) shows up in availableEndpoints as a
+                        // TYPE_BLUETOOTH endpoint even though it is NOT the audio route
+                        // and the user is not using it for audio. That idle watch was
+                        // silently blocking the speaker nudge, leaving Joe on earpiece.
+                        // Turning the watch's Bluetooth off made the nudge fire and Joe
+                        // came up on speaker and HELD there all session — confirming the
+                        // watch-in-the-available-list was the sole blocker.
+                        //
+                        // The fix: key on current == EARPIECE alone. If the car, a wired
+                        // headset, or real BT headphones were the ACTIVE route, the
+                        // current endpoint would BE that device (we saw currentEndpoint=
+                        // Uconnect in the car), NOT earpiece. So "current == earpiece"
+                        // already proves nothing better is active, and moving to speaker
+                        // steals from nothing. A watch merely *available* is irrelevant.
+                        if (current.type != CallEndpointCompat.TYPE_EARPIECE) return
 
                         val speaker = latestEndpoints.firstOrNull {
                             it.type == CallEndpointCompat.TYPE_SPEAKER
                         }
                         if (speaker == null) {
-                            Log.i(TAG, "2B-nudge: on earpiece, nothing better, but no SPEAKER endpoint offered — leaving as-is")
+                            Log.i(TAG, "2B-nudge: on earpiece but no SPEAKER endpoint offered — leaving as-is")
                             return
                         }
 
