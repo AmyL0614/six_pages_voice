@@ -150,6 +150,78 @@ class SixPagesVoicePlugin :
 
     private var audioTrack: AudioTrack? = null
 
+    // --- PLAYBACK QUEUE + WRITER THREAD -------------------------------------
+    // WHY THIS EXISTS (2026-07-19): feedPlayback() used to call
+    // audioTrack.write() DIRECTLY, on the Flutter MAIN THREAD, INSIDE
+    // synchronized(playbackLock). AudioTrack.write() on a MODE_STREAM track is
+    // documented BLOCKING: "these are blocking and return when the data has
+    // been transferred from the Java layer to the native layer and queued for
+    // playback." ElevenLabs delivers a turn FASTER THAN REALTIME, so the track
+    // buffer is full essentially the whole time Joe speaks and every write
+    // blocks. Three consequences, all real, all observed:
+    //
+    //   1. THE UI FROZE while Joe spoke. No scroll, no taps -- and critically
+    //      the Quiet-mode button could not be pressed. The July 19 immediate-
+    //      stop fix was never the problem: the button simply could not be
+    //      reached until playback ended on its own.
+    //   2. THE AEC3 DELAY READ WAS STARVED. currentStreamDelayMs() needs
+    //      playbackLock to read framesWritten; it blocked behind the in-lock
+    //      write for most of every turn -- exactly when cancellation needs it.
+    //      A plausible contributor to the stuttering/slurring reports.
+    //   3. TEARDOWN QUEUED BEHIND THE WRITE. stopPlayback() also takes
+    //      playbackLock.
+    //
+    // THE ANDROID CONTRACT (not an iOS port -- verified against Google's own
+    // guidance): AudioTrack.write() is documented thread-safe with respect to
+    // stop(), and because write() blocks it does NOT make sense to call
+    // pause() from the same thread as write(). A dedicated writer thread, with
+    // play/pause/flush/stop driven from another thread, is the sanctioned
+    // pattern. That is what this is. It also VALIDATES the July 19 teardown
+    // fix: pause()/flush()/stop() are MEANT to be called off the writer thread.
+    //
+    // NO ADDED LATENCY. A queue in front of a blocking write does not delay
+    // audio. The write blocks because the track buffer is already full, i.e.
+    // the audio is already committed and playing. Bytes wait either here or in
+    // the caller's stack frame; arrival at the speaker is identical. What is
+    // removed is the main thread's stall.
+    //
+    // Structure deliberately MIRRORS captureThread below (plain Thread, plain
+    // array-backed ring, join() on teardown) so both directions of this plugin
+    // read the same way for anyone auditing the repo.
+    private var playbackThread: Thread? = null
+    @Volatile private var playing = false
+
+    // Drop-NEWEST ring. Sized to hold the longest turn Joe can produce without
+    // overflowing: 180 s of PCM16/16k mono = 180 * 16000 * 2 = 5,760,000 B.
+    // NOT smaller: a measured Joe turn has run to ~50 s, and the producer
+    // outruns the drain, so a short ring silently deletes the END of what Joe
+    // is about to say. ~5.5 MB is nothing on target hardware.
+    // The 20 ms frame contract (PCM16 / 16 kHz / mono) shared by capture,
+    // playback and AEC3. Was previously duplicated as a local in both
+    // startPlayback() and startCapture(); promoted to a field so the playback
+    // ring drains in exactly the same frame size everything else speaks in.
+    private val frameBytes = 640
+
+    private val playbackRingBytes = 5_760_000
+    private val playbackRing = ByteArray(playbackRingBytes)
+    private var ringHead = 0            // read index  (writer thread only)
+    private var ringTail = 0            // write index (feedPlayback only)
+    private var ringCount = 0           // bytes available; guarded by ringLock
+    private val ringLock = Any()
+
+    // Bytes discarded because the ring was full when a chunk arrived. This is
+    // the Android counterpart of the iOS droppedBytes counter, and it exists
+    // for the same reason: overflow has been MISDIAGNOSED AS STARVATION more
+    // than once in this project, and a counter is the only thing that settles
+    // it. iOS needs a diagnostic strip because it has no console; Android has
+    // logcat, so it is logged there -- throttled to ~1/sec so it cannot bury
+    // the strip, plus a frozen read at SESSION_END before teardown wipes it.
+    // IF THIS IS > 0, THE RING OVERFLOWED AND JOE'S LATER AUDIO WAS DELETED.
+    // That is a COMPLETE explanation of "degrades late" / "tail missing".
+    // Look no further until it is zero.
+    @Volatile private var droppedBytes: Long = 0L
+    @Volatile private var dropDiagCounter = 0
+
     private var savedAudioMode = AudioManager.MODE_NORMAL
 
     // Live only for the duration of a session; nulled in clearSpeakerRoute().
@@ -344,24 +416,30 @@ class SixPagesVoicePlugin :
             "feedPlayback" -> {
                 val pcm = call.arguments as? ByteArray
                 if (pcm != null) {
-                    // Feed Joe's playback to AEC3 as the far-end reference
-                    // BEFORE it hits the speaker, then play it. Order matters:
-                    // AEC3 must see the reference at least as early as the echo
-                    // arrives at the mic. Held under aecLock so a concurrent
-                    // stop()/destroy cannot free the handle mid-call.
-                    synchronized(aecLock) {
-                        val h = aecHandle
-                        if (h != 0L) {
-                            nativeProcessRender(h, pcm)
-                        }
-                    }
-                    // Write to the speaker and account the frames so the delay
-                    // measurement knows how much audio we've committed. PCM16
-                    // mono => 2 bytes per frame.
-                    synchronized(playbackLock) {
-                        audioTrack?.write(pcm, 0, pcm.size)
-                        framesWritten += (pcm.size / 2).toLong()
-                    }
+                    // ENQUEUE ONLY. RETURNS IMMEDIATELY. NEVER BLOCKS.
+                    //
+                    // This runs on the Flutter MAIN THREAD. It must not do any
+                    // of the following, all of which used to happen here:
+                    //   - AEC3 nativeProcessRender  (moved to playbackThread)
+                    //   - audioTrack.write          (moved to playbackThread)
+                    //   - framesWritten accounting  (moved to playbackThread)
+                    // See the PLAYBACK QUEUE comment block above for why.
+                    //
+                    // AEC3 AND framesWritten DELIBERATELY DID NOT STAY HERE.
+                    // Both are tied to the MOMENT OF THE ACTUAL WRITE, not the
+                    // moment of arrival:
+                    //   - nativeProcessRender must land immediately BEFORE the
+                    //     write so the AEC3 reference stays in step with what
+                    //     the speaker is emitting. Left on this thread it would
+                    //     run AHEAD of playback by the whole queue depth.
+                    //   - framesWritten feeds currentStreamDelayMs(), which
+                    //     computes inFlight = framesWritten - framesPlayed.
+                    //     Incrementing at ENQUEUE time would inflate that by up
+                    //     to the full ring, blow past the 0..sampleRate sanity
+                    //     check, and SILENTLY corrupt the delay handed to
+                    //     nativeSetStreamDelayMs -- degraded cancellation, no
+                    //     crash, no error. Increment happens after the write.
+                    enqueuePlayback(pcm)
                     renderFrames++  // A1: Joe is still being fed to us.
                 }
                 result.success(null)
@@ -908,6 +986,76 @@ class SixPagesVoicePlugin :
 
     // --- Playback: comms path ---
 
+    // Producer side. Called on the Flutter MAIN THREAD from feedPlayback.
+    // Copies into the ring and returns. Drop-NEWEST on overflow, matching the
+    // iOS ring's policy: if we are already 180 s behind, the oldest audio is
+    // what Joe actually needs to finish saying, and discarding it would cut a
+    // reflection off mid-thought.
+    private fun enqueuePlayback(pcm: ByteArray) {
+        synchronized(ringLock) {
+            val free = playbackRingBytes - ringCount
+            if (pcm.size > free) {
+                droppedBytes += pcm.size.toLong()
+                // Throttled so a sustained overflow cannot bury logcat. Same
+                // discipline as the A1 HEAD line (cut from 50/sec to 1/sec).
+                dropDiagCounter++
+                if (dropDiagCounter % 50 == 0) {
+                    Log.w(tag, "PLAYBACK RING OVERFLOW: droppedBytes=$droppedBytes (ring full, ${'$'}{pcm.size}B discarded) - JOE'S LATER AUDIO IS BEING DELETED")
+                }
+                return
+            }
+            // Copy in, wrapping at the end of the ring.
+            val first = minOf(pcm.size, playbackRingBytes - ringTail)
+            System.arraycopy(pcm, 0, playbackRing, ringTail, first)
+            if (first < pcm.size) {
+                System.arraycopy(pcm, first, playbackRing, 0, pcm.size - first)
+            }
+            ringTail = (ringTail + pcm.size) % playbackRingBytes
+            ringCount += pcm.size
+            (ringLock as Object).notifyAll()
+        }
+    }
+
+    // Consumer side. Called ONLY on playbackThread. Blocks until bytes are
+    // available or the session is torn down. Returns null when playing==false.
+    private fun dequeuePlayback(): ByteArray? {
+        synchronized(ringLock) {
+            while (playing && ringCount == 0) {
+                try {
+                    (ringLock as Object).wait(100)
+                } catch (_: InterruptedException) {
+                    return null
+                }
+            }
+            if (!playing || ringCount == 0) return null
+            // Drain up to one 20 ms frame at a time (640 B), matching the frame
+            // contract the rest of the plugin and AEC3 are built around.
+            val n = minOf(ringCount, frameBytes)
+            val out = ByteArray(n)
+            val first = minOf(n, playbackRingBytes - ringHead)
+            System.arraycopy(playbackRing, ringHead, out, 0, first)
+            if (first < n) {
+                System.arraycopy(playbackRing, 0, out, first, n - first)
+            }
+            ringHead = (ringHead + n) % playbackRingBytes
+            ringCount -= n
+            return out
+        }
+    }
+
+    // Discards everything queued but not yet written. Called on teardown BEFORE
+    // the AudioTrack pause/flush/stop, so the writer thread cannot push more
+    // bytes at a track we are about to flush.
+    private fun clearPlaybackRing() {
+        synchronized(ringLock) {
+            ringHead = 0
+            ringTail = 0
+            ringCount = 0
+            (ringLock as Object).notifyAll()
+        }
+    }
+
+
     private fun startPlayback(): Boolean {
         if (audioTrack != null) return true
         val minBuf = AudioTrack.getMinBufferSize(sampleRate, outChannelConfig, audioFormat)
@@ -935,6 +1083,57 @@ class SixPagesVoicePlugin :
         audioTrack = track
         track.play()
 
+        // WRITER THREAD. This -- not the main thread -- is the ONLY caller of
+        // audioTrack.write(). Created here and join()ed in stopPlayback(), so
+        // its lifetime is tied to the AudioTrack it writes to and it can never
+        // outlive the track. Symmetric with captureThread/stopCapture below.
+        playing = true
+        playbackThread = Thread {
+            while (playing) {
+                val pcm = dequeuePlayback() ?: continue
+
+                // ORDER IS LOAD-BEARING AND IS THE SAME ORDER THIS CODE HAS
+                // ALWAYS USED -- it has simply moved off the main thread:
+                //   (1) AEC3 render reference, (2) write, (3) frame accounting.
+                //
+                // (1) AEC3 must see the reference at least as early as the echo
+                //     reaches the mic. Under aecLock so a concurrent
+                //     stop()/destroy cannot free the handle mid-call.
+                synchronized(aecLock) {
+                    val h = aecHandle
+                    if (h != 0L) {
+                        nativeProcessRender(h, pcm)
+                    }
+                }
+
+                // (2) The blocking call. It blocks HERE now, where blocking is
+                //     harmless, instead of on the main thread where it froze
+                //     the UI. Deliberately OUTSIDE playbackLock: holding that
+                //     lock across a blocking syscall is what starved
+                //     currentStreamDelayMs() on the capture thread.
+                val track = audioTrack ?: break
+                val wrote = try {
+                    track.write(pcm, 0, pcm.size)
+                } catch (_: IllegalStateException) {
+                    break  // track released underneath us during teardown
+                }
+
+                // (3) Account ONLY what was actually accepted, and only after
+                //     the write. framesWritten feeds
+                //     currentStreamDelayMs() -> nativeSetStreamDelayMs().
+                //     PCM16 mono => 2 bytes per frame. playbackLock is now held
+                //     for a counter increment, not a blocking write.
+                if (wrote > 0) {
+                    synchronized(playbackLock) {
+                        framesWritten += (wrote / 2).toLong()
+                    }
+                }
+            }
+        }.apply {
+            name = "SixPagesVoicePlayback"
+            start()
+        }
+
         // Read the ACTUAL allocated buffer size (may exceed what we requested)
         // and reset the frame counter. The buffer size drives the warm-up
         // fallback delay. Logged so the real number is visible in logcat.
@@ -947,6 +1146,35 @@ class SixPagesVoicePlugin :
     }
 
     private fun stopPlayback() {
+        // TEARDOWN ORDER. Mirrors the proven voiceEndConversation ordering in
+        // Dart: CLOSE THE TAP FIRST, then tear down. Any other order lets the
+        // writer thread push fresh bytes at a track we are about to flush, and
+        // the July 19 immediate-stop fix silently stops working.
+        //
+        //   1. playing = false        -- writer stops looping
+        //   2. clearPlaybackRing()    -- discard everything not yet written,
+        //                                and wake the writer out of wait()
+        //   3. join the writer        -- no write() can be in flight after this
+        //   4. pause -> flush -> stop -- the July 19 fix, now genuinely safe
+        //
+        // Steps 1-3 are new. Step 4 is UNCHANGED and still load-bearing.
+        playing = false
+        clearPlaybackRing()
+        try {
+            playbackThread?.join(500)
+        } catch (_: InterruptedException) {
+        }
+        playbackThread = null
+
+        // A1-style: freeze the overflow counter BEFORE the reset below wipes
+        // it. A droppedBytes read after teardown is meaningless -- the same
+        // lesson the iOS Hard Rules were written in blood over.
+        if (droppedBytes > 0) {
+            Log.w(tag, "SESSION_END playback ring: droppedBytes=$droppedBytes -- THE RING OVERFLOWED; Joe's later audio was discarded. Read this BEFORE blaming the buffer depth or the network.")
+        } else {
+            Log.i(tag, "SESSION_END playback ring: droppedBytes=0 (no overflow)")
+        }
+
         audioTrack?.let {
             try {
                 // IMMEDIATE STOP, NOT A POLITE ONE.
@@ -967,9 +1195,12 @@ class SixPagesVoicePlugin :
                 // these two lines silently restores the old behavior and the bug
                 // comes back looking like it was never fixed.
                 //
-                // There is no upstream PCM queue to drain: feedPlayback() writes
-                // straight to audioTrack.write(), so the AudioTrack's own buffer is
-                // the ONLY place unplayed audio can live. Flushing it is complete.
+                // WAS TRUE UNTIL 2026-07-19, NO LONGER: there IS now an upstream
+                // PCM queue (the playback ring above). feedPlayback() no longer
+                // writes straight to audioTrack.write(). Flushing the track alone
+                // is therefore NOT complete on its own -- the ring must be cleared
+                // and the writer thread joined FIRST, which is exactly what the
+                // steps at the top of this function do. Do not reorder them.
                 if (it.playState == AudioTrack.PLAYSTATE_PLAYING) {
                     it.pause()   // halt output immediately
                     it.flush()   // discard everything written but not yet played
@@ -984,6 +1215,10 @@ class SixPagesVoicePlugin :
             framesWritten = 0
             trackBufferFrames = 0
         }
+        // Reset AFTER the SESSION_END log above, so a stale count from the last
+        // run can never be mistaken for a live one.
+        droppedBytes = 0L
+        dropDiagCounter = 0
     }
 
     // Fallback render->capture delay (ms) used during the getTimestamp() warm-up
@@ -1078,7 +1313,6 @@ class SixPagesVoicePlugin :
 
         val minBuf = AudioRecord.getMinBufferSize(sampleRate, inChannelConfig, audioFormat)
         if (minBuf == AudioRecord.ERROR || minBuf == AudioRecord.ERROR_BAD_VALUE) return false
-        val frameBytes = 640
         val bufferBytes = maxOf(minBuf, frameBytes * 4)
 
         val record = AudioRecord(
