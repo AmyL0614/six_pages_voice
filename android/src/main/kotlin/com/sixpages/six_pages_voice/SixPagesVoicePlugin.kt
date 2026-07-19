@@ -949,7 +949,32 @@ class SixPagesVoicePlugin :
     private fun stopPlayback() {
         audioTrack?.let {
             try {
-                if (it.playState == AudioTrack.PLAYSTATE_PLAYING) it.stop()
+                // IMMEDIATE STOP, NOT A POLITE ONE.
+                //
+                // AudioTrack.stop() on a MODE_STREAM track is documented to keep
+                // playing "after the last buffer that was written has been played."
+                // It returns instantly, so the Dart teardown looked fast (58ms end
+                // to end in the 07-18 18:42:20 log) while the speaker kept talking.
+                // That is the End-Call delay: someone hits Quiet mode to be quiet
+                // NOW, and Joe finishes his sentence anyway.
+                //
+                // Apple-style politeness is wrong here. Android's documented recipe
+                // for an immediate stop is pause() then flush() to discard audio
+                // that has not been played back yet.
+                //
+                // ORDERING IS LOAD-BEARING: flush() is a documented NO-OP unless the
+                // track is stopped or paused. pause() MUST come first. Reversing
+                // these two lines silently restores the old behavior and the bug
+                // comes back looking like it was never fixed.
+                //
+                // There is no upstream PCM queue to drain: feedPlayback() writes
+                // straight to audioTrack.write(), so the AudioTrack's own buffer is
+                // the ONLY place unplayed audio can live. Flushing it is complete.
+                if (it.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    it.pause()   // halt output immediately
+                    it.flush()   // discard everything written but not yet played
+                }
+                it.stop()
             } catch (_: IllegalStateException) {
             }
             it.release()
