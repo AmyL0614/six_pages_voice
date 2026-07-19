@@ -52,8 +52,10 @@ This plugin is the two ends of the loop — everything above the dashed line and
                   │
                   ▼
    ┌──────────────────────────────┐
-   │   Lock-free SPSC ring        │   180 s of capacity, because TTS
+   │   Ring buffer                │   180 s of capacity, because TTS
    │   180 s (5,760,000 bytes)    │   arrives faster than real time
+   │                              │   iOS:     lock-free SPSC
+   │                              │   Android: writer thread + ring
    └──────────────────────────────┘
                   │
                   ▼
@@ -67,6 +69,8 @@ This plugin is the two ends of the loop — everything above the dashed line and
 ```
 
 On **both** platforms the session is registered as a real call, and the *platform* owns audio routing — the plugin does not drive `setCommunicationDevice` or `overrideOutputAudioPort`. The car, the headset, the speaker: the OS routes to them because it is holding a call, not because the plugin forced a device. That single decision — declare a call, then get out of the way — is what makes cars work and what stopped the routing from fighting itself.
+
+`feedPlayback()` is **fire-and-forget on both platforms**: it hands bytes to the ring and returns immediately. It never blocks the caller, so a long TTS turn cannot freeze your UI. On iOS a render callback drains the ring; on Android a dedicated writer thread does. Different mechanisms, same contract — and on Android that is not a port of the iOS design but the pattern Android's own documentation calls for, since `AudioTrack.write()` blocks and is thread-safe with respect to `stop()`.
 
 The far-end signal is fed back into the canceller, which is why the AI does not transcribe itself while it is speaking.
 
@@ -82,7 +86,8 @@ The far-end signal is fed back into the canceller, which is why the AI does not 
 - **Bluetooth HFP** — bidirectional, including **automotive** head units
 - **Bluetooth A2DP** — output-only devices (headphones, speakers)
 - **Wired headsets, USB, and speaker** — the platform selects; the plugin does not override
-- **Lock-free SPSC ring buffer** — 180 seconds of capacity (5,760,000 bytes), so a TTS turn delivered *faster than real time* never overflows
+- **180-second ring buffer** (5,760,000 bytes) — so a TTS turn delivered *faster than real time* never overflows. Lock-free SPSC on iOS; writer thread plus ring on Android.
+- **`feedPlayback()` never blocks the caller** — on both platforms it enqueues and returns. Your UI stays responsive for the whole of a reply, which means a stop or mute control is still pressable *while the AI is speaking*.
 - **Automatic route following** — audio follows the device the user connects mid-conversation, because the platform owns the route
 - **Survives screen lock** — Android foreground service (`microphone` type) + partial wakelock, alongside the Core-Telecom call; iOS background audio
 - **Rich diagnostics** — a single-line strip that makes failures legible. This is how the car bug was found.
@@ -240,6 +245,17 @@ The plugin's manifest declares:
 
 `MANAGE_OWN_CALLS` is required by `CallsManager.addCall`. The `phoneCall` and `connectedDevice` foreground types are **declared** so the library can promote them; the plugin's own `startForeground` call still passes `microphone` only.
 
+**Playback runs on its own thread.** `AudioTrack.write()` on a `MODE_STREAM` track is documented **blocking** — it returns only once the bytes are queued to the audio sink, so when the track buffer is full (which, against faster-than-real-time TTS, is most of a turn) the calling thread stalls. If that caller is the Flutter main thread, the UI freezes for the length of the reply: no scroll, no taps, and no way to press a stop or mute control until the audio finishes on its own.
+
+So `feedPlayback()` only enqueues. A dedicated `SixPagesVoicePlayback` thread owns every `write()`. This is Android's own contract, not a design borrowed from iOS: `write()` is thread-safe with respect to `stop()`, and because `write()` blocks it does not make sense to call `pause()` from the writing thread. A writer thread, with `play` / `pause` / `flush` / `stop` driven from another thread, is the sanctioned arrangement — and it is what makes the immediate-stop teardown below actually reachable.
+
+Two details on that thread are load-bearing, and both are about AEC3:
+
+- **`nativeProcessRender` moved with the write, not with the enqueue.** The far-end reference has to reach AEC3 immediately before the bytes reach the speaker. Left on the calling thread it would run ahead of playback by the whole ring depth.
+- **`framesWritten` is incremented *after* the write, counting only bytes actually accepted.** It feeds `inFlight = framesWritten - framesPlayed` into `setStreamDelayMs`. Increment it at enqueue time and that figure inflates by the ring depth, sails past the sanity check, and silently corrupts cancellation — no crash, no error, just worse echo.
+
+Teardown order is therefore: stop the writer, clear the ring, join the thread, then `pause()` → `flush()` → `stop()` on the track. `flush()` is a documented no-op unless the track is stopped or paused, so `pause()` must come first; reversing those two lines restores the old "the AI finishes its sentence after you hang up" behaviour and looks like the fix was never made.
+
 **Your app must declare and request `RECORD_AUDIO` itself**, plus `POST_NOTIFICATIONS` (Android 13+) for the foreground-service notification. The plugin does not request these for you.
 
 ---
@@ -278,6 +294,14 @@ This is the same lesson on both platforms, and it is worth stating plainly: **th
 The plugin maintains a single-line diagnostic strip that makes failures legible. It is the single most valuable thing in this repository.
 
 The strip below is the **iOS** one — CallKit-centric, read back over the method channel because iOS has no console you can reach from Windows. **Android** exposes the equivalent through `logcat` (filter to `SixPagesVoice`): the same discipline — capture state at the moment of a failure — applied to the platform you can actually `adb` into. On the Telecom path, watch `availableEndpoints` / `currentEndpoint` (what the framework offers and routes to) and the `2B-nudge` lines (the one speaker steer), the way you watch `ckTrail` on iOS.
+
+`droppedBytes` exists on **both** platforms now. Android reports it two ways: a throttled warning (~1/sec) while an overflow is actually happening, and a frozen read at teardown before the counter is wiped —
+
+```
+SESSION_END playback ring: droppedBytes=0 (no overflow)
+```
+
+Also watch the `measured stream delay = N ms (source=TS|HEAD|FALLBACK)` line. It should tick roughly once per second *throughout* a turn, including while the AI is speaking. If it stalls whenever audio plays, something is holding the playback lock across a blocking call and AEC3 is running on a stale delay estimate — which sounds like stuttering and slurring, not like a lock bug.
 
 A healthy automotive run (iOS):
 
@@ -335,6 +359,12 @@ That is Telecom's default for a call with nothing else connected. Nudge to the s
 
 **Playback degrades late in long replies; the tail is missing.**
 Ring overflow. `droppedBytes > 0`. Do **not** add priming depth — that makes it worse.
+
+**The UI freezes while the AI is speaking; the stop button cannot be pressed (Android).**
+Something is calling `AudioTrack.write()` on the main thread. It blocks — for the length of the reply, against faster-than-real-time TTS. The button is not broken, it is unreachable. Move every `write()` to a dedicated thread and make the enqueue path return immediately.
+
+**Stuttering or slurring on Android, with no dropped bytes and no network fault.**
+Check whether the playback lock is held across the `write()`. If it is, the delay measurement on the capture thread blocks behind it for most of every turn, and AEC3 spends the turn working from a stale `setStreamDelayMs`. Hold that lock for the counter update only — never across the blocking call. Confirm with the `measured stream delay` cadence in `logcat`: steady ticks during playback, not silence.
 
 **Audio sounds thin or tinny on Bluetooth headphones.**
 Check `granted=`. A2DP headphones force the hardware to 48 kHz, and a 16 kHz source upsampled to 48 kHz cannot regain information it never had. In a car, HFP grants 16 kHz natively and the artifact disappears.
