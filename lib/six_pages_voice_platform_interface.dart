@@ -28,6 +28,10 @@ abstract class SixPagesVoicePlatform extends PlatformInterface {
     throw UnimplementedError('feedPlayback() has not been implemented.');
   }
 
+  Future<bool> clearPlayback() {
+    throw UnimplementedError('clearPlayback() has not been implemented.');
+  }
+
   Stream<Uint8List> get captureStream {
     throw UnimplementedError('captureStream has not been implemented.');
   }

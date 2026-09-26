@@ -4,7 +4,7 @@ import 'six_pages_voice_platform_interface.dart';
 
 /// An implementation of [SixPagesVoicePlatform] that uses method channels.
 class MethodChannelSixPagesVoice extends SixPagesVoicePlatform {
-  /// Discrete commands to native: start, stop, feedPlayback.
+  /// Discrete commands to native: start, stop, feedPlayback, clearPlayback.
   @visibleForTesting
   final methodChannel = const MethodChannel('six_pages_voice/control');
 
@@ -28,6 +28,19 @@ class MethodChannelSixPagesVoice extends SixPagesVoicePlatform {
   @override
   Future<void> feedPlayback(Uint8List pcm) async {
     await methodChannel.invokeMethod<void>('feedPlayback', pcm);
+  }
+
+  @override
+  Future<bool> clearPlayback() async {
+    try {
+      final ok = await methodChannel.invokeMethod<bool>('clearPlayback');
+      return ok ?? false;
+    } on MissingPluginException {
+      // The native side has no clearPlayback yet (Android, until its build
+      // lands). Report false rather than throw, so callers can use it on
+      // every platform.
+      return false;
+    }
   }
 
   @override

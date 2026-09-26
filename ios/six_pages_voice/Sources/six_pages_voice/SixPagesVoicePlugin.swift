@@ -9,6 +9,57 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ───────────────────────────────────────────────────────────────────────────
 // SixPagesVoicePlugin — iOS
 //
+// BUILD 23: clearPlayback() -- HONOUR THE ELEVENLABS `interruption` EVENT.
+//
+// WHAT WAS MISSING. When the person talks over the agent, ElevenLabs sends
+//   { "type": "interruption", "interruption_event": { "event_id": <int> } }
+// and stops generating. Its own SDKs then do two things (read, not assumed --
+// elevenlabs-python conversation.py + default_audio_interface.py, and the
+// elevenlabs/packages JS client, Sep 26):
+//   1. empty the playback queue: "User has interrupted the agent and all
+//      previously buffered audio output should be stopped."
+//   2. ignore any later audio_event whose event_id is at or below the
+//      interruption's (Python: drop `event_id <= last_interrupt_id`).
+// This plugin had no way to do (1). ElevenLabs delivers a turn FASTER THAN
+// REALTIME (Hard Rule 2), so most of a reply is already in the 180 s ring by
+// the time anyone interrupts -- and it all kept playing. That is why the person
+// could never interrupt, even with interruptions switched on. (2) lives in Dart,
+// in the app, where the socket is.
+//
+// HOW IT IS DONE WITHOUT BREAKING THE LOCK-FREE RING. The ring is single-
+// producer / single-consumer: feedPlayback() (main thread) owns writeIndex, the
+// render callback (audio thread) owns readIndex, and clear() is documented as
+// "only when the unit is stopped". So a mid-call clear does NOT reuse clear():
+//   * clearPlayback() runs on the SAME main thread as feedPlayback(). It only
+//     records a MARK = the current writeIndex: "everything written so far is
+//     stale". It never touches readIndex.
+//   * The render callback -- the owner of readIndex -- sees the mark on its next
+//     cycle (<= one buffer, ~20 ms), fades the first 10 ms of the stale audio to
+//     zero so the cut does not click, and moves readIndex forward to the mark.
+//   * Anything written AFTER the mark (the next reply) is kept. Nothing new is
+//     ever clipped.
+//   * primed is set false -- the state the ring already reaches when a reply
+//     drains -- so the EXISTING ~100 ms startup cushion (Build 3) applies to the
+//     next reply exactly as it does at the start of every turn. NO new cushion,
+//     NO new gate, NO change to the 180 s capacity or to drop-newest. This is NOT ea45974 and NOT Build 9: it does not pause
+//     the drain against a faster-than-realtime producer; it discards stale bytes.
+//
+// THE FADE. A hard cut mid-waveform can pop. 10 ms (160 samples) ramped 1 -> 0,
+// on the audio thread, once per interruption -- ElevenLabs' web client also
+// fades on interrupt rather than cutting. Too short to hear as a fade.
+//
+// ON THE STRIP (getDiagnostics, appended at the end): interruptClears= (clears
+// the audio thread performed that found unplayed audio) and clearedBytes=
+// (stale bytes discarded, fade included).
+//
+// NOTHING ELSE MOVED. CallKit (19-22), retained instance (21), setPreferredInput
+// (17), 180 s ring and drop-newest (11), droppedBytes (7), memcpy ring (8),
+// priming (3) all intact. setActive(true) still absent. Android untouched in
+// this build: its clearPlayback returns "not implemented" and the Dart wrapper
+// reports false, so the app can call it on both platforms safely.
+//
+// ───────────────────────────────────────────────────────────────────────────
+//
 // BUILD 22: AN INSTRUMENT, NOT A FIX. NO BEHAVIOR CHANGES. NONE.
 //
 // FIVE BUILDS -- 19, 19a, 19b, 20, 21 -- all died the same way on a bare iPad: the button
@@ -909,21 +960,32 @@ private final class ByteRingBuffer {
   private let droppedBytesPtr: UnsafeMutablePointer<Int>
   var droppedBytes: Int { return droppedBytesPtr.pointee }
 
+  // Build 23: the interruption DISCARD MARK. Written ONLY by the producer thread
+  // (the same main thread as write()), as a copy of writeIndex: "everything
+  // written up to here is stale". Read by the consumer (render callback) with
+  // acquire ordering. Free-running like the indices; reset only in clear().
+  // The consumer never writes it, so SPSC ownership is unchanged: writeIndex and
+  // the mark belong to the producer, readIndex belongs to the consumer.
+  private let discardMarkPtr: UnsafeMutablePointer<Int>
+
   init(capacityBytes: Int) {
     self.capacity = capacityBytes
     self.storage = [UInt8](repeating: 0, count: capacityBytes)
     self.writeIndex = UnsafeMutablePointer<Int>.allocate(capacity: 1)
     self.readIndex = UnsafeMutablePointer<Int>.allocate(capacity: 1)
     self.droppedBytesPtr = UnsafeMutablePointer<Int>.allocate(capacity: 1)
+    self.discardMarkPtr = UnsafeMutablePointer<Int>.allocate(capacity: 1)
     self.writeIndex.initialize(to: 0)
     self.readIndex.initialize(to: 0)
     self.droppedBytesPtr.initialize(to: 0)
+    self.discardMarkPtr.initialize(to: 0)
   }
 
   deinit {
     writeIndex.deinitialize(count: 1); writeIndex.deallocate()
     readIndex.deinitialize(count: 1); readIndex.deallocate()
     droppedBytesPtr.deinitialize(count: 1); droppedBytesPtr.deallocate()
+    discardMarkPtr.deinitialize(count: 1); discardMarkPtr.deallocate()
   }
 
   // Bytes currently available to read. Safe to call from either thread.
@@ -1035,12 +1097,40 @@ private final class ByteRingBuffer {
     return out
   }
 
+  /// Build 23 — PRODUCER side. Must be called on the same thread as write()
+  /// (the platform main thread, where every method-channel call lands). Marks
+  /// every byte written so far as stale. Never touches readIndex, so it is safe
+  /// mid-stream. Bytes written after this call are NOT marked.
+  func markDiscardUpToCurrentWrite() {
+    _store(discardMarkPtr, writeIndex.pointee)   // producer owns writeIndex
+  }
+
+  /// Build 23 — CONSUMER side (render callback only). Stale bytes still ahead of
+  /// readIndex, i.e. how far the consumer must move to reach the mark. 0 when no
+  /// discard is pending. Never more than what is actually in the ring.
+  func pendingDiscardBytes() -> Int {
+    let r = readIndex.pointee                    // consumer owns readIndex
+    let m = _load(discardMarkPtr)
+    let w = _load(writeIndex)
+    let target = min(m, w)
+    return target > r ? target - r : 0
+  }
+
+  /// Build 23 — CONSUMER side (render callback only). Move readIndex forward to
+  /// the mark, discarding the stale bytes. Returns how many were discarded.
+  func discardPending() -> Int {
+    let n = pendingDiscardBytes()
+    if n > 0 { _store(readIndex, readIndex.pointee + n) }
+    return n
+  }
+
   /// Reset. NOT lock-free-safe against concurrent access — only call when the
   /// audio unit is stopped (start()/stop() paths), never mid-stream. Matches the
   /// previous clear()'s contract (it was only called from stop/start).
   func clear() {
     _store(writeIndex, 0)
     _store(readIndex, 0)
+    _store(discardMarkPtr, 0)   // Build 23: the mark is free-running too
     droppedBytesPtr.pointee = 0
   }
 }
@@ -1425,6 +1515,15 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   fileprivate var primeThresholdBytes = 0   // set in startUnit from hwRate (~100 ms)
   fileprivate var reprimeEvents = 0
 
+  // Build 23: interruption clears performed by the render callback, and the
+  // stale bytes they discarded (fade included). Coarse diagnostics, same
+  // threading as the counters above. Reset per session.
+  fileprivate var interruptClears: Int = 0
+  fileprivate var clearedBytes: Int = 0
+  // Build 23: 10 ms of 16 kHz mono PCM16 = 160 samples = 320 bytes, faded 1 -> 0
+  // at the moment of an interruption so the cut does not click.
+  fileprivate static let interruptFadeBytes = 320
+
   // Build 4: actual hardware sample rate read at start (e.g. 48000), kept ONLY
   // for the diagnostic string. Playback no longer converts to it — the output
   // bus is 16 kHz and VoiceProcessingIO resamples 16k→hardware internally.
@@ -1616,8 +1715,23 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
         + "routeChanges=\(routeChangeCount); spkDefault=\(speakerDefaultOn ? "on" : "off"); "
         + "policyApplies=\(policyApplyCount); policyFails=\(policyFailCount); "
         + "why=[\(routeHistory.joined(separator: " | "))]"
-      result(lastDiagnostics + live)
+      // Build 23: appended as its OWN string rather than as one more term in the
+      // long `live` chain above, so the type-checker's work on that expression is
+      // unchanged. These are ElevenLabs conversational interruptions (the person
+      // talked over the agent) -- NOT the AVAudioSession interruptions= counter.
+      // interruptClears counts only clears that found unplayed audio: 0 after an
+      // interruption means either the clear never arrived, or the reply had
+      // already finished playing (nothing left to clear).
+      let build23 = "interruptClears=\(interruptClears); clearedBytes=\(clearedBytes)"
+      result(lastDiagnostics + live + "; " + build23)
 
+    case "clearPlayback":
+      // Build 23: the ElevenLabs `interruption` event. See the header. Runs on the
+      // main thread, the same thread as feedPlayback, so it may read writeIndex.
+      // Answers true when a unit is running (the render callback will act on the
+      // mark within one buffer), false when nothing is playing.
+      playback.markDiscardUpToCurrentWrite()
+      result(isRunning)
     case "feedPlayback":
       if let typed = call.arguments as? FlutterStandardTypedData {
         // Build 4: write Joe's raw 16 kHz PCM16 straight to the ring. NO manual
@@ -2548,6 +2662,8 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     // Build 8: reset render-time max and read the mach timebase once (used to
     // convert render-callback ticks → microseconds on the audio thread).
     maxRenderMicros = 0
+    interruptClears = 0   // Build 23
+    clearedBytes = 0      // Build 23
     var tb = mach_timebase_info_data_t()
     mach_timebase_info(&tb)
     machTimebaseNumer = tb.numer
@@ -2721,6 +2837,45 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     }
     let buffers = UnsafeMutableAudioBufferListPointer(abl)
     plugin.renderCalls &+= 1
+
+    // Build 23: INTERRUPTION CLEAR. clearPlayback() (main thread) left a mark; this
+    // callback owns readIndex, so the discard happens HERE. If audio is audible
+    // (primed), the first 10 ms of the stale audio is played with the gain ramped
+    // 1 -> 0 so the cut does not click; then readIndex jumps to the mark. Audio
+    // written after the mark (the next reply) is untouched. primed goes false, so
+    // the existing Build 3 startup cushion applies -- no new cushion, no new gate.
+    let pendingDiscard = plugin.playback.pendingDiscardBytes()
+    if pendingDiscard > 0 {
+      var faded = 0
+      for buffer in buffers {
+        guard let mData = buffer.mData else { continue }
+        let size = Int(buffer.mDataByteSize)
+        memset(mData, 0, size)
+        if plugin.primed && faded == 0 {
+          // Whole Int16 samples only.
+          let want = min(pendingDiscard, SixPagesVoicePlugin.interruptFadeBytes, size) & ~1
+          let got = plugin.playback.read(into: mData, count: want)
+          let n = got / 2
+          if n > 0 {
+            let samples = mData.assumingMemoryBound(to: Int16.self)
+            for i in 0..<n {
+              let gain = Float(n - 1 - i) / Float(n)
+              samples[i] = Int16(Float(samples[i]) * gain)
+            }
+          }
+          faded = got
+        }
+      }
+      let skipped = plugin.playback.discardPending()
+      plugin.interruptClears &+= 1
+      plugin.clearedBytes &+= (faded + skipped)
+      plugin.primed = false
+      if faded == 0 {
+        ioActionFlags.pointee.insert(.unitRenderAction_OutputIsSilence)
+      }
+      plugin.recordRenderTime(since: renderStart) // Build 8
+      return noErr
+    }
 
     // Build 3: priming gate. If not yet primed, wait for the cushion. Emit clean
     // silence and return WITHOUT counting an underrun — this is intentional

@@ -24,6 +24,22 @@ class SixPagesVoice {
     return SixPagesVoicePlatform.instance.feedPlayback(pcm);
   }
 
+  /// Discards the agent's audio that has been fed but not yet played, fading
+  /// the last few milliseconds so the cut does not click.
+  ///
+  /// Call this when ElevenLabs sends an `interruption` event — it is what
+  /// ElevenLabs' own SDKs do ("all previously buffered audio output should be
+  /// stopped"). Pair it with dropping any later `audio` event whose `event_id`
+  /// is at or below the interruption's `event_id`. Audio fed AFTER this call
+  /// plays normally.
+  ///
+  /// Returns true when the clear was handed to a running audio unit. Returns
+  /// false when nothing is playing, or when this platform does not support it
+  /// yet (currently Android), so it is always safe to call.
+  Future<bool> clearPlayback() {
+    return SixPagesVoicePlatform.instance.clearPlayback();
+  }
+
   /// The clean, echo-free capture stream (PCM16, 16 kHz, mono) coming up
   /// from native. Feed this to VAD's audioStream.
   Stream<Uint8List> get captureStream {
