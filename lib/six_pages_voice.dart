@@ -33,9 +33,13 @@ class SixPagesVoice {
   /// is at or below the interruption's `event_id`. Audio fed AFTER this call
   /// plays normally.
   ///
-  /// Returns true when the clear was handed to a running audio unit. Returns
-  /// false when nothing is playing, or when this platform does not support it
-  /// yet (currently Android), so it is always safe to call.
+  /// Returns true when the clear was handed to a running session. Returns
+  /// false when nothing is playing, or when the native side is an older build
+  /// without clearPlayback, so it is always safe to call.
+  ///
+  /// iOS discards within one render buffer. Android discards everything queued
+  /// ahead of the AudioTrack; the track's own small buffer (about 100 ms on
+  /// tested hardware) plays out, so echo-cancellation timing is never disturbed.
   Future<bool> clearPlayback() {
     return SixPagesVoicePlatform.instance.clearPlayback();
   }

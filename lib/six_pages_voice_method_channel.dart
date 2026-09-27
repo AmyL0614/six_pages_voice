@@ -36,9 +36,8 @@ class MethodChannelSixPagesVoice extends SixPagesVoicePlatform {
       final ok = await methodChannel.invokeMethod<bool>('clearPlayback');
       return ok ?? false;
     } on MissingPluginException {
-      // The native side has no clearPlayback yet (Android, until its build
-      // lands). Report false rather than throw, so callers can use it on
-      // every platform.
+      // An older native build without clearPlayback. Report false rather than
+      // throw, so callers can use it on every platform.
       return false;
     }
   }

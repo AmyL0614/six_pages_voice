@@ -222,6 +222,15 @@ class SixPagesVoicePlugin :
     @Volatile private var droppedBytes: Long = 0L
     @Volatile private var dropDiagCounter = 0
 
+    // Android A2: ElevenLabs conversational interruptions handled by
+    // clearPlayback(), and the stale bytes they discarded. Logged per clear and
+    // frozen at SESSION_END, like droppedBytes. Reset per session.
+    @Volatile private var interruptClears = 0
+    @Volatile private var clearedBytes: Long = 0L
+    // 10 ms of PCM16 / 16 kHz / mono = 160 samples = 320 bytes, faded 1 -> 0 so
+    // the cut does not click. Same length as the iOS fade (Build 23).
+    private val interruptFadeBytes = 320
+
     private var savedAudioMode = AudioManager.MODE_NORMAL
 
     // Live only for the duration of a session; nulled in clearSpeakerRoute().
@@ -443,6 +452,12 @@ class SixPagesVoicePlugin :
                     renderFrames++  // A1: Joe is still being fed to us.
                 }
                 result.success(null)
+            }
+            "clearPlayback" -> {
+                // Android A2: the ElevenLabs `interruption` event. See
+                // clearPlaybackForInterruption(). Runs on the main thread, the
+                // same thread as feedPlayback's enqueue.
+                result.success(clearPlaybackForInterruption())
             }
             else -> result.notImplemented()
         }
@@ -1055,6 +1070,83 @@ class SixPagesVoicePlugin :
         }
     }
 
+    // --- ANDROID A2: clearPlayback() FOR THE ELEVENLABS `interruption` EVENT ---
+    //
+    // WHAT WAS MISSING. When the person talks over the agent, ElevenLabs sends
+    //   {"type":"interruption","interruption_event":{"event_id":<int>}}
+    // and stops generating. Its own SDKs then empty the playback queue (the
+    // elevenlabs-python AudioInterface.interrupt() contract: stop all previously
+    // buffered output) and drop later audio at or below that event_id.
+    //
+    // MEASURED ON THIS DEVICE, Sep 27 (logcat, SM-S928U): interruption
+    // event_id=306 arrived with lastPlayedAudioEventId=237, and staleChunksDropped
+    // was 0 on both interruptions -- ElevenLabs had ALREADY delivered the whole
+    // reply before the person spoke (it runs faster than realtime). So every
+    // stale byte was sitting in THIS ring, and without a clear the agent talked
+    // over the person to the end of the reply while the screen had already moved
+    // on. The iOS half landed as Build 23 (a0317f0); this is Android's.
+    //
+    // WHAT IT DOES. Under ringLock, on the main thread (the same thread that
+    // enqueues), it keeps only the next 10 ms of queued audio, ramps it down to
+    // silence in place, and discards the rest. Audio enqueued after this call (the next
+    // reply) plays normally. The writer thread is untouched: it simply dequeues
+    // the faded tail, then waits for new audio as it does between turns.
+    //
+    // WHAT IT DELIBERATELY DOES NOT DO: pause() + flush() the AudioTrack.
+    //   * The track's own buffer is small: bufferSizeInFrames=1610 on the
+    //     SM-S928U (logcat Sep 27) = ~100 ms. That, plus at most the one 20 ms
+    //     frame the writer is inside write() with, is all that still plays --
+    //     the same order as the iOS clear, which acts within one render buffer.
+    //   * flush() resets getPlaybackHeadPosition() to zero, and framesWritten
+    //     would have to be reset in the same instant as a write() that may be
+    //     blocked on the writer thread. Get that wrong and inFlight =
+    //     framesWritten - framesPlayed goes wrong, and AEC3's stream delay is
+    //     corrupted SILENTLY (see the framesWritten notes above). Discarding
+    //     upstream of the writer keeps every accounting rule exactly as it is:
+    //     discarded bytes were never rendered to AEC3, never written, never
+    //     counted, and never reach the speaker. The AEC3 reference still matches
+    //     what the speaker plays, byte for byte.
+    //
+    // SAMPLE ALIGNMENT. The fade reads PCM16 samples in place, so it needs
+    // ringHead on a sample boundary. The plugin does not enforce that callers
+    // feed whole samples (the Six Pages app does: it holds an odd trailing byte
+    // for the next chunk), so it is CHECKED here: if ringHead is odd, the fade
+    // is skipped and the queue is discarded plainly rather than decoding
+    // misaligned byte pairs into a noise burst. The ring size is even, so an
+    // aligned sample never straddles the wrap.
+    //
+    // Returns true when a session was playing, false otherwise.
+    private fun clearPlaybackForInterruption(): Boolean {
+        if (!playing) return false
+        var discarded = 0
+        var kept = 0
+        synchronized(ringLock) {
+            val queued = ringCount
+            val aligned = (ringHead % 2 == 0)
+            kept = if (aligned) minOf(queued, interruptFadeBytes) and 1.inv() else 0
+            val n = kept / 2
+            for (i in 0 until n) {
+                val lo = (ringHead + 2 * i) % playbackRingBytes
+                val hi = (lo + 1) % playbackRingBytes
+                val sample = ((playbackRing[hi].toInt() shl 8) or
+                    (playbackRing[lo].toInt() and 0xFF)).toShort().toInt()
+                val gain = (n - 1 - i).toFloat() / n.toFloat()
+                val faded = (sample * gain).toInt()
+                playbackRing[lo] = (faded and 0xFF).toByte()
+                playbackRing[hi] = ((faded shr 8) and 0xFF).toByte()
+            }
+            discarded = queued - kept
+            ringTail = (ringHead + kept) % playbackRingBytes
+            ringCount = kept
+            (ringLock as Object).notifyAll()
+        }
+        interruptClears++
+        clearedBytes += discarded.toLong()
+        Log.i(tag, "INTERRUPT CLEAR: discarded=${discarded}B fadedKept=${kept}B " +
+            "trackBufferFrames=$trackBufferFrames (track buffer plays out; not flushed)")
+        return true
+    }
+
 
     private fun startPlayback(): Boolean {
         if (audioTrack != null) return true
@@ -1174,6 +1266,8 @@ class SixPagesVoicePlugin :
         } else {
             Log.i(tag, "SESSION_END playback ring: droppedBytes=0 (no overflow)")
         }
+        // Android A2: interruption clears this session, frozen before the reset.
+        Log.i(tag, "SESSION_END interruptions: interruptClears=$interruptClears clearedBytes=$clearedBytes")
 
         audioTrack?.let {
             try {
@@ -1219,6 +1313,8 @@ class SixPagesVoicePlugin :
         // run can never be mistaken for a live one.
         droppedBytes = 0L
         dropDiagCounter = 0
+        interruptClears = 0     // Android A2
+        clearedBytes = 0L       // Android A2
     }
 
     // Fallback render->capture delay (ms) used during the getTimestamp() warm-up
