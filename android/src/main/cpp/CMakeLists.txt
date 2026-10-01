@@ -6,6 +6,10 @@
 # sealed CI workflow (produce-prebuilt.yml) from the pinned vendored source.
 #
 # Only arm64-v8a is shipped (see build.gradle.kts abiFilters).
+#
+# 16 KB page sizes: the shim is linked with 16 KB ELF segment alignment (see
+# target_link_options below), as Google Play requires of apps targeting
+# Android 15+. See https://developer.android.com/guide/practices/page-sizes
 
 cmake_minimum_required(VERSION 3.22.1)
 project(six_pages_voice_aec3)
@@ -38,6 +42,24 @@ endif()
 
 # The JNI shim.
 add_library(six_pages_voice_aec3 SHARED aec3_shim.cpp)
+
+# 16 KB ELF alignment. Devices configured with a 16 KB memory page size can
+# only load a shared library whose LOAD segments are 16 KB aligned, and Google
+# Play requires 16 KB support for apps targeting Android 15 (API 35) and up.
+# NDK r28 and later align to 16 KB by default; this plugin is deliberately
+# pinned to NDK r27 (build.gradle.kts) to match the toolchain that produced the
+# prebuilt archive, and Google's guidance for r27 and lower is these two linker
+# flags (https://developer.android.com/guide/practices/page-sizes, "Android NDK
+# r27 and lower" > CMake). common-page-size also keeps the RELRO segment end
+# on a 16 KB boundary, which r27 does not do by default.
+#
+# Alignment is fixed at THIS link, so the static archive below needs no
+# rebuild: it contributes object code, not segments. Nothing in the shim or
+# the archive assumes a 4 KB page - Abseil's mmap-based allocator reads the
+# page size at runtime (sysconf(_SC_PAGESIZE)), as Google recommends.
+target_link_options(six_pages_voice_aec3 PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384")
 
 # Header search paths:
 #   - the webrtc-audio-processing-1/ prefix, so the library's own internal
