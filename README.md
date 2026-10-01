@@ -159,6 +159,8 @@ await voice.stop();
 
 **`start()` is genuinely asynchronous on iOS.** It does not resolve until the system has activated the audio session and the audio unit is running. When it returns `true`, the engine is live and it is safe to feed playback. If it returns `false`, the session did not open — do not feed it. (There is a 4-second internal deadline, so a failure fails loudly rather than hanging forever.)
 
+**Known limitation: the call name is fixed.** The name the system shows for the call is currently set inside the plugin to **"Claude"**, the agent in the app this plugin was built for. It appears on the iOS and Android call screens and on a car's dashboard, and Android's ongoing notification reads **"Talking with Claude"**. Your app cannot change these yet. Making both configurable from `start()` is the next planned change (see [Roadmap](#roadmap)); until then, expect your users to see that name.
+
 A runnable demo lives in [`example/`](example/lib/main.dart).
 
 ---
@@ -469,6 +471,7 @@ AEC is not receiving the far-end signal. On Android, AEC3 needs *both* sides fed
 
 ## Roadmap
 
+- [ ] **Next:** let the host app set the call name (CallKit caller name on iOS, Core-Telecom display name on Android) and the Android notification text, passed through `start()`, with a neutral default. Both are currently fixed to this project's agent name, "Claude".
 - [ ] Expose the diagnostic strip in the Dart facade (iOS already returns it over the method channel as `getDiagnostics`; Android logs to `logcat`)
 - [x] 16 KB memory page support for the Android AEC3 library (linked with 16 KB ELF alignment; Play Console reports "Supports 16 KB" for a release bundle built with it)
 - [x] Example application
