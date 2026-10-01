@@ -8,7 +8,7 @@ Full-duplex, echo-cancelled, low-latency voice — on the phone speaker, on wire
 
 Originally developed for [Six Pages](https://thesixpages.app), a trauma-informed voice and writing companion. Extracted and open-sourced because the infrastructure shouldn't have to be rebuilt by the next person.
 
-**[Why this exists](#why-this-exists)** · **[Architecture](#architecture)** · **[Features](#features)** · **[Install](#install)** · **[Usage](#usage)** · **[iOS setup](#ios-setup--required)** · **[Android setup](#android-setup)** · **[The car bug](#the-car-bug)** · **[Diagnostics](#diagnostics)** · **[Common issues](#common-issues)**
+**[Why this exists](#why-this-exists)** · **[Architecture](#architecture)** · **[Features](#features)** · **[Install](#install)** · **[Usage](#usage)** · **[Interruptions](#interruptions-barge-in)** · **[iOS setup](#ios-setup--required)** · **[Android setup](#android-setup)** · **[The car bug](#the-car-bug)** · **[Diagnostics](#diagnostics)** · **[Common issues](#common-issues)**
 
 ---
 
@@ -74,6 +74,8 @@ On **both** platforms the session is registered as a real call, and the *platfor
 
 The far-end signal is fed back into the canceller, which is why the AI does not transcribe itself while it is speaking.
 
+`clearPlayback()` is the one way back *into* the ring from your side: when the person talks over the AI, it discards the audio that has been fed but not yet played, so the AI actually stops. See [Interruptions](#interruptions-barge-in).
+
 ---
 
 ## Features
@@ -88,6 +90,7 @@ The far-end signal is fed back into the canceller, which is why the AI does not 
 - **Wired headsets, USB, and speaker** — the platform selects; the plugin does not override
 - **180-second ring buffer** (5,760,000 bytes) — so a TTS turn delivered *faster than real time* never overflows. Lock-free SPSC on iOS; writer thread plus ring on Android.
 - **`feedPlayback()` never blocks the caller** — on both platforms it enqueues and returns. Your UI stays responsive for the whole of a reply, which means a stop or mute control is still pressable *while the AI is speaking*.
+- **Barge-in** — `clearPlayback()` discards queued, unplayed audio with a 10 ms fade when the person interrupts, so the AI stops talking instead of finishing a reply that was already delivered faster than real time
 - **Automatic route following** — audio follows the device the user connects mid-conversation, because the platform owns the route
 - **Survives screen lock** — Android foreground service (`microphone` type) + partial wakelock, alongside the Core-Telecom call; iOS background audio
 - **Rich diagnostics** — a single-line strip that makes failures legible. This is how the car bug was found.
@@ -98,10 +101,12 @@ The far-end signal is fed back into the canceller, which is why the AI does not 
 
 ## Platforms
 
-| Platform | Status | AEC | Call framework | Bluetooth HFP | Car |
-|---|---|---|---|---|---|
-| Android | Supported | WebRTC AEC3 | Jetpack Core-Telecom | Yes | Proven (final routing verification in progress) |
-| iOS | Supported | VoiceProcessingIO | CallKit | Yes | Proven |
+| Platform | Status | AEC | Call framework | Bluetooth HFP | Car | Interruptions |
+|---|---|---|---|---|---|---|
+| Android | Supported | WebRTC AEC3 | Jetpack Core-Telecom | Yes | Proven (final routing verification in progress) | Yes (A2, device-tested) |
+| iOS | Supported | VoiceProcessingIO | CallKit | Yes | Proven | Yes (Build 23, device-tested) |
+
+**Android ABI.** The AEC3 native library is built for **arm64-v8a only**. The plugin loads it when the plugin class initializes, so 32-bit-only devices are not supported.
 
 ---
 
@@ -121,7 +126,7 @@ Pin a full 40-character SHA. A short hash that happens to be all digits gets par
 
 ## Usage
 
-The API is intentionally small. Four things.
+The API is intentionally small. Five things.
 
 ```dart
 import 'package:six_pages_voice/six_pages_voice.dart';
@@ -142,6 +147,10 @@ voice.captureStream.listen((Uint8List frame) {
 // Write it straight in — no resampling needed, the platform handles it.
 voice.feedPlayback(pcmBytes);
 
+// The person talked over the AI: drop what is queued but not yet played.
+// Safe to call at any time; returns false when nothing was playing.
+await voice.clearPlayback();
+
 // Tear down.
 await voice.stop();
 ```
@@ -149,6 +158,61 @@ await voice.stop();
 **`start()` is genuinely asynchronous on iOS.** It does not resolve until the system has activated the audio session and the audio unit is running. When it returns `true`, the engine is live and it is safe to feed playback. If it returns `false`, the session did not open — do not feed it. (There is a 4-second internal deadline, so a failure fails loudly rather than hanging forever.)
 
 A runnable demo lives in [`example/`](example/lib/main.dart).
+
+---
+
+## Interruptions (barge-in)
+
+A streaming TTS service delivers a reply **faster than real time**, so by the time the person starts talking over the AI, most of the reply is already sitting in the plugin's ring. Stopping generation upstream does nothing for audio that has already arrived. Without a way to empty the ring, the AI finishes its sentence no matter what the person does, even with interruptions switched on at the service.
+
+`clearPlayback()` is that way.
+
+### What your app does
+
+With ElevenLabs Conversational AI, the server sends
+
+```json
+{ "type": "interruption", "interruption_event": { "event_id": 306 } }
+```
+
+when the person interrupts, and each `audio` event carries `audio_event.audio_base_64` and `audio_event.event_id` ([ElevenLabs WebSocket reference](https://elevenlabs.io/docs/agents-platform/api-reference/agents-platform/websocket)). ElevenLabs' own SDKs then do two things (read from the Python client's `conversation.py` and `default_audio_interface.py`, and the JavaScript client, September 2026):
+
+1. **Empty the playback queue.** That is `clearPlayback()`.
+2. **Ignore any later `audio` event whose `event_id` is at or below the interruption's.** That filter belongs in your app, where the socket is. The plugin never sees event IDs.
+
+```dart
+import 'dart:convert';
+
+int lastInterruptId = -1;
+
+void onServerMessage(Map<String, dynamic> msg) {
+  switch (msg['type']) {
+    case 'interruption':
+      lastInterruptId = msg['interruption_event']['event_id'] as int;
+      voice.clearPlayback();
+      break;
+    case 'audio':
+      final ev = msg['audio_event'];
+      if ((ev['event_id'] as int) <= lastInterruptId) return; // stale
+      voice.feedPlayback(base64Decode(ev['audio_base_64'] as String));
+      break;
+  }
+}
+```
+
+Audio fed **after** `clearPlayback()` (the next reply) plays normally.
+
+`clearPlayback()` returns `true` when the clear was handed to a running session, and `false` when nothing is playing, or when the native side is an older build without it. It never throws, so it is safe to call on every platform.
+
+### What the plugin does
+
+Both platforms keep the next **10 ms** of queued audio, ramp it to silence so the cut does not click, and discard the rest. Neither adds a cushion or a gate, changes the 180 s capacity, or changes drop-newest overflow.
+
+- **iOS.** The ring is lock-free single-producer / single-consumer. `clearPlayback()` runs on the main thread (the producer) and only records a *mark* at the current write position. The render callback (the consumer, and the owner of the read position) sees the mark within one buffer, about 20 ms, fades and skips to it. The existing startup cushion applies to the next reply exactly as it does at the start of every turn.
+- **Android.** `clearPlayback()` runs on the main thread under the ring lock and discards everything queued ahead of the writer thread. **It does not `pause()` or `flush()` the `AudioTrack`.** The track's own buffer (about 100 ms on tested hardware) plays out. `flush()` resets the playback head position, and re-syncing `framesWritten` against a `write()` that may be blocked on the writer thread is race-prone. A mismatch would silently corrupt the AEC3 stream delay (`inFlight = framesWritten − framesPlayed`). Discarding *upstream* of the writer keeps every accounting rule intact: discarded bytes are never rendered to AEC3, never written and never counted, so the echo reference still matches what the speaker plays.
+- **Sample alignment.** The fade reads PCM16 samples in place, so it needs the ring position on a sample boundary. The plugin does not force callers to feed whole samples. If the position is odd, it skips the fade and discards plainly rather than turning misaligned byte pairs into a burst of noise. Feeding whole samples (an even number of bytes) is recommended.
+
+Measured on device before it was written (Android, September 27, 2026): two interruptions, with `staleChunksDropped=0` both times on the app's `event_id` filter. ElevenLabs had already delivered the entire reply, so every stale byte was in the ring. Only a native clear helps.
 
 ---
 
@@ -301,6 +365,18 @@ The strip below is the **iOS** one — CallKit-centric, read back over the metho
 SESSION_END playback ring: droppedBytes=0 (no overflow)
 ```
 
+Interruptions log two lines on Android. One is written per clear:
+
+```
+INTERRUPT CLEAR: discarded=<bytes>B fadedKept=<bytes>B trackBufferFrames=<frames> (track buffer plays out; not flushed)
+```
+
+The other is a frozen count at teardown:
+
+```
+SESSION_END interruptions: interruptClears=<n> clearedBytes=<bytes>
+```
+
 Also watch the `measured stream delay = N ms (source=TS|HEAD|FALLBACK)` line. It should tick roughly once per second *throughout* a turn, including while the AI is speaking. If it stalls whenever audio plays, something is holding the playback lock across a blocking call and AEC3 is running on a stale delay estimate — which sounds like stuttering and slurring, not like a lock bug.
 
 A healthy automotive run (iOS):
@@ -326,6 +402,7 @@ How to read it:
 | `renderCalls` vs `captureCalls` | Should be equal — the mic fired on every render cycle. |
 | `granted=` | The hardware sample rate. `[MATCHES 16k]` means no resampling. A 48 kHz grant means the 16 kHz source is being upsampled. |
 | `route` / `routeChanges` / `why=[]` | In a car, an **empty** `why=[]` is the goal. It means the platform was left alone. |
+| `interruptClears` / `clearedBytes` | Appended at the end of the strip. Clears that found unplayed audio, and the stale bytes discarded (fade included). These are **conversational** interruptions (barge-in), not the AVAudioSession `interruptions=` counter. |
 
 **Counter-intuitive, and it cost three wrong fixes:** low underruns *plus* an audio problem means **overflow**, not starvation. Streaming TTS delivers a turn *faster than real time*, while the render callback drains at natural speech rate. The producer outruns the drain, always. Adding buffer depth or a re-buffering gate **pauses the drain** and makes it worse. Check `droppedBytes` first.
 
@@ -369,6 +446,9 @@ Check whether the playback lock is held across the `write()`. If it is, the dela
 **Audio sounds thin or tinny on Bluetooth headphones.**
 Check `granted=`. A2DP headphones force the hardware to 48 kHz, and a 16 kHz source upsampled to 48 kHz cannot regain information it never had. In a car, HFP grants 16 kHz natively and the artifact disappears.
 
+**The person cannot interrupt; the AI keeps talking to the end of its reply.**
+You are not calling `clearPlayback()` on the service's interruption event, or you are re-feeding stale audio. ElevenLabs sends the whole reply faster than real time, so it is already in the ring. Call `clearPlayback()` on `interruption`, and drop any later `audio` whose `event_id` is at or below the interruption's. If `clearPlayback()` returns `false` while audio is audibly playing, the native side is an older build: pin a newer commit.
+
 **The AI transcribes its own voice.**
 AEC is not receiving the far-end signal. On Android, AEC3 needs *both* sides fed — verify that playback frames are reaching it, not just the mic.
 
@@ -376,7 +456,8 @@ AEC is not receiving the far-end signal. On Android, AEC3 needs *both* sides fed
 
 ## Roadmap
 
-- [ ] Expose the diagnostic strip over the method channel and in the Dart facade
+- [ ] Expose the diagnostic strip in the Dart facade (iOS already returns it over the method channel as `getDiagnostics`; Android logs to `logcat`)
+- [ ] 16 KB memory page support for the Android AEC3 library. Google Play requires it for app updates from February 1, 2027, and the library is currently linked at 4 KB alignment.
 - [x] Example application
 - [ ] API documentation
 - [ ] pub.dev release
