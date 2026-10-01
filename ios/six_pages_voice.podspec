@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'six_pages_voice'
-  s.version          = '0.0.1'
+  s.version          = '0.2.0'
   s.summary          = 'Low-latency ElevenLabs voice with acoustic echo cancellation for Flutter.'
   s.description      = <<-DESC
 A Flutter plugin providing a real-time voice pipeline with native acoustic echo
