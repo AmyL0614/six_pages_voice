@@ -108,6 +108,8 @@ The far-end signal is fed back into the canceller, which is why the AI does not 
 
 **Android ABI.** The AEC3 native library is built for **arm64-v8a only**. The plugin loads it when the plugin class initializes, so 32-bit-only devices are not supported.
 
+**16 KB memory pages.** The AEC3 native library is linked with 16 KB ELF alignment, so it loads on devices that use a 16 KB page size and meets Google Play's 16 KB requirement for apps targeting Android 15 (API 35) and up. See [Android setup](#android-setup) for how.
+
 ---
 
 ## Install
@@ -320,6 +322,17 @@ Two details on that thread are load-bearing, and both are about AEC3:
 
 Teardown order is therefore: stop the writer, clear the ring, join the thread, then `pause()` → `flush()` → `stop()` on the track. `flush()` is a documented no-op unless the track is stopped or paused, so `pause()` must come first; reversing those two lines restores the old "the AI finishes its sentence after you hang up" behaviour and looks like the fix was never made.
 
+**16 KB memory pages.** Devices configured with a 16 KB page size can only load a native library whose segments are 16 KB aligned, and Google Play requires this of apps targeting Android 15 (API 35) and up. NDK r28 and later align to 16 KB by default, but this plugin is deliberately pinned to **NDK r27** to match the toolchain that built its prebuilt WebRTC archive. For r27 and lower, Google's guidance is two linker flags on the shared library, which `android/src/main/cpp/CMakeLists.txt` sets with `target_link_options`:
+
+```
+-Wl,-z,max-page-size=16384
+-Wl,-z,common-page-size=16384
+```
+
+The prebuilt archive needs no rebuild: alignment is fixed when the plugin's own `.so` is linked, and a static archive contributes object code, not segments. Nothing in the shim or the archive assumes a 4 KB page — Abseil's `mmap`-based allocator reads the page size at runtime with `sysconf(_SC_PAGESIZE)`, which is what Google recommends. Source: [Support 16 KB page sizes](https://developer.android.com/guide/practices/page-sizes).
+
+This covers the plugin's library only. Every other native library in your app must be 16 KB aligned too; Play Console's App bundle explorer lists any that are not, by name, under **Memory page size**.
+
 **Your app must declare and request `RECORD_AUDIO` itself**, plus `POST_NOTIFICATIONS` (Android 13+) for the foreground-service notification. The plugin does not request these for you.
 
 ---
@@ -457,7 +470,7 @@ AEC is not receiving the far-end signal. On Android, AEC3 needs *both* sides fed
 ## Roadmap
 
 - [ ] Expose the diagnostic strip in the Dart facade (iOS already returns it over the method channel as `getDiagnostics`; Android logs to `logcat`)
-- [ ] 16 KB memory page support for the Android AEC3 library. Google Play requires it for app updates from February 1, 2027, and the library is currently linked at 4 KB alignment.
+- [x] 16 KB memory page support for the Android AEC3 library (linked with 16 KB ELF alignment; Play Console reports "Supports 16 KB" for a release bundle built with it)
 - [x] Example application
 - [ ] API documentation
 - [ ] pub.dev release
