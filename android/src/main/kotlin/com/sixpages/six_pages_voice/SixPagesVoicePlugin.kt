@@ -24,12 +24,12 @@ import io.flutter.plugin.common.MethodChannel.Result
 /**
  * SixPagesVoicePlugin — CAPTURE + PLAYBACK + SPEAKER ROUTING + WebRTC AEC3.
  *
- * Owns mic capture and Joe's playback through the OS voice-communication path.
+ * Owns mic capture and the agent's playback through the OS voice-communication path.
  * Echo cancellation is done by WebRTC's AEC3 (software), via the native shim
  * (libsix_pages_voice_aec3.so), NOT by the Android hardware AcousticEchoCanceler
  * — that hardware unit reported enabled=true on the SM-S928U but did not
  * actually cancel (proven by ElevenLabs transcripts). AEC3 needs BOTH sides:
- *   - the render reference: Joe's playback PCM, fed via nativeProcessRender()
+ *   - the render reference: the agent's playback PCM, fed via nativeProcessRender()
  *     BEFORE it is written to the AudioTrack (feedPlayback()).
  *   - the capture stream: the mic PCM, cleaned in place via nativeProcessCapture()
  *     on the capture thread BEFORE each frame is posted to Dart.
@@ -157,10 +157,10 @@ class SixPagesVoicePlugin :
     // documented BLOCKING: "these are blocking and return when the data has
     // been transferred from the Java layer to the native layer and queued for
     // playback." ElevenLabs delivers a turn FASTER THAN REALTIME, so the track
-    // buffer is full essentially the whole time Joe speaks and every write
+    // buffer is full essentially the whole time the agent speaks and every write
     // blocks. Three consequences, all real, all observed:
     //
-    //   1. THE UI FROZE while Joe spoke. No scroll, no taps -- and critically
+    //   1. THE UI FROZE while the agent spoke. No scroll, no taps -- and critically
     //      the Quiet-mode button could not be pressed. The July 19 immediate-
     //      stop fix was never the problem: the button simply could not be
     //      reached until playback ended on its own.
@@ -191,10 +191,10 @@ class SixPagesVoicePlugin :
     private var playbackThread: Thread? = null
     @Volatile private var playing = false
 
-    // Drop-NEWEST ring. Sized to hold the longest turn Joe can produce without
+    // Drop-NEWEST ring. Sized to hold the longest turn the agent can produce without
     // overflowing: 180 s of PCM16/16k mono = 180 * 16000 * 2 = 5,760,000 B.
-    // NOT smaller: a measured Joe turn has run to ~50 s, and the producer
-    // outruns the drain, so a short ring silently deletes the END of what Joe
+    // NOT smaller: a measured agent turn has run to ~50 s, and the producer
+    // outruns the drain, so a short ring silently deletes the END of what the agent
     // is about to say. ~5.5 MB is nothing on target hardware.
     // The 20 ms frame contract (PCM16 / 16 kHz / mono) shared by capture,
     // playback and AEC3. Was previously duplicated as a local in both
@@ -216,7 +216,7 @@ class SixPagesVoicePlugin :
     // it. iOS needs a diagnostic strip because it has no console; Android has
     // logcat, so it is logged there -- throttled to ~1/sec so it cannot bury
     // the strip, plus a frozen read at SESSION_END before teardown wipes it.
-    // IF THIS IS > 0, THE RING OVERFLOWED AND JOE'S LATER AUDIO WAS DELETED.
+    // IF THIS IS > 0, THE RING OVERFLOWED AND THE AGENT'S LATER AUDIO WAS DELETED.
     // That is a COMPLETE explanation of "degrades late" / "tail missing".
     // Look no further until it is zero.
     @Volatile private var droppedBytes: Long = 0L
@@ -357,7 +357,7 @@ class SixPagesVoicePlugin :
 
     // --- AEC3 render->capture delay, MEASURED (not guessed) --------------
     //
-    // AEC3 needs the delay between handing Joe's frame to ProcessReverseStream
+    // AEC3 needs the delay between handing the agent's frame to ProcessReverseStream
     // and the echo of that frame being captured by the mic. Guessing this
     // (Step A: fixed 120 ms) only half-worked. Here we MEASURE it from the
     // AudioTrack's own playback clock:
@@ -449,7 +449,7 @@ class SixPagesVoicePlugin :
                     //     nativeSetStreamDelayMs -- degraded cancellation, no
                     //     crash, no error. Increment happens after the write.
                     enqueuePlayback(pcm)
-                    renderFrames++  // A1: Joe is still being fed to us.
+                    renderFrames++  // A1: the agent is still being fed to us.
                 }
                 result.success(null)
             }
@@ -601,7 +601,7 @@ class SixPagesVoicePlugin :
     // Focus is what gives us STANDING to hold the route we are already selecting
     // correctly. Requesting it is following Android's contract, not imposing ours.
     //
-    // AUDIOFOCUS_GAIN, not GAIN_TRANSIENT: a conversation with Joe is not a transient
+    // AUDIOFOCUS_GAIN, not GAIN_TRANSIENT: a conversation with the agent is not a transient
     // beep. It is the foreground audio activity for as long as it lasts.
     //
     // We do NOT fail the session if focus is denied. A denial is logged and we proceed,
@@ -685,7 +685,7 @@ class SixPagesVoicePlugin :
     // Preference order. A headset the user CHOSE (paired or plugged in) always
     // wins over the built-in speaker. Speaker is the FALLBACK, not an override:
     // forcing TYPE_BUILTIN_SPEAKER unconditionally would yank audio away from
-    // someone's AirPods or car and broadcast Joe out loud — the exact opposite
+    // someone's AirPods or car and broadcast the agent out loud — the exact opposite
     // of what a private companion conversation needs.
     private val routePreference = intArrayOf(
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
@@ -815,7 +815,7 @@ class SixPagesVoicePlugin :
     }
 
     // Follows the audio to a headset connected MID-CONVERSATION. Someone reaching
-    // for headphones while talking to Joe is a "make this private, now" moment;
+    // for headphones while talking to the agent is a "make this private, now" moment;
     // audio has to follow. Also handles the reverse — unplug and fall back to speaker.
     private fun registerRouteListener() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
@@ -1004,7 +1004,7 @@ class SixPagesVoicePlugin :
     // Producer side. Called on the Flutter MAIN THREAD from feedPlayback.
     // Copies into the ring and returns. Drop-NEWEST on overflow, matching the
     // iOS ring's policy: if we are already 180 s behind, the oldest audio is
-    // what Joe actually needs to finish saying, and discarding it would cut a
+    // what the agent actually needs to finish saying, and discarding it would cut a
     // reflection off mid-thought.
     private fun enqueuePlayback(pcm: ByteArray) {
         synchronized(ringLock) {
@@ -1015,7 +1015,7 @@ class SixPagesVoicePlugin :
                 // discipline as the A1 HEAD line (cut from 50/sec to 1/sec).
                 dropDiagCounter++
                 if (dropDiagCounter % 50 == 0) {
-                    Log.w(tag, "PLAYBACK RING OVERFLOW: droppedBytes=$droppedBytes (ring full, ${'$'}{pcm.size}B discarded) - JOE'S LATER AUDIO IS BEING DELETED")
+                    Log.w(tag, "PLAYBACK RING OVERFLOW: droppedBytes=$droppedBytes (ring full, ${'$'}{pcm.size}B discarded) - THE AGENT'S LATER AUDIO IS BEING DELETED")
                 }
                 return
             }
@@ -1262,7 +1262,7 @@ class SixPagesVoicePlugin :
         // it. A droppedBytes read after teardown is meaningless -- the same
         // lesson the iOS Hard Rules were written in blood over.
         if (droppedBytes > 0) {
-            Log.w(tag, "SESSION_END playback ring: droppedBytes=$droppedBytes -- THE RING OVERFLOWED; Joe's later audio was discarded. Read this BEFORE blaming the buffer depth or the network.")
+            Log.w(tag, "SESSION_END playback ring: droppedBytes=$droppedBytes -- THE RING OVERFLOWED; the agent's later audio was discarded. Read this BEFORE blaming the buffer depth or the network.")
         } else {
             Log.i(tag, "SESSION_END playback ring: droppedBytes=0 (no overflow)")
         }
@@ -1278,7 +1278,7 @@ class SixPagesVoicePlugin :
                 // It returns instantly, so the Dart teardown looked fast (58ms end
                 // to end in the 07-18 18:42:20 log) while the speaker kept talking.
                 // That is the End-Call delay: someone hits Quiet mode to be quiet
-                // NOW, and Joe finishes his sentence anyway.
+                // NOW, and the agent finishes its sentence anyway.
                 //
                 // Apple-style politeness is wrong here. Android's documented recipe
                 // for an immediate stop is pause() then flush() to discard audio
@@ -1452,7 +1452,7 @@ class SixPagesVoicePlugin :
                 if (read > 0) {
                     // A1: the mic is alive. If Android SILENTLY MUTES us under
                     // projection (H2), read() keeps returning bytes but this is
-                    // the counter to watch against renderFrames: Joe still
+                    // the counter to watch against renderFrames: the agent still
                     // speaking (renderFrames climbing) while captureFrames goes
                     // flat is the signature of a muted mic, and it is otherwise
                     // completely invisible — no error, no callback, nothing.

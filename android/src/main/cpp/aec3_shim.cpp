@@ -6,7 +6,7 @@
 //
 // Contract exposed to Kotlin (three operations):
 //   nativeCreate()                       -> long handle   (APM with AEC3 on)
-//   nativeProcessRender(handle, byte[])  -> void          (feed Joe / far-end)
+//   nativeProcessRender(handle, byte[])  -> void          (feed the agent's audio / far-end)
 //   nativeProcessCapture(handle, byte[]) -> void          (clean mic in place)
 //   nativeDestroy(handle)                -> void
 //

@@ -65,7 +65,7 @@ import kotlinx.coroutines.selects.select
  *
  * PLUGIN <-> SERVICE BRIDGE (minimal, by design):
  * This service and the plugin communicate through two lightweight signals, sized
- * for the one-call-per-device reality (each phone ever holds exactly one Joe
+ * for the one-call-per-device reality (each phone ever holds exactly one agent
  * conversation — "thousands of users" is thousands of isolated phones, never two
  * calls in one process):
  *   - plugin -> service: startForSession() / the disconnect request via
@@ -299,8 +299,8 @@ class VoiceSessionService : LifecycleService() {
                         // Venu, Galaxy Watch, etc.) shows up in availableEndpoints as a
                         // TYPE_BLUETOOTH endpoint even though it is NOT the audio route
                         // and the user is not using it for audio. That idle watch was
-                        // silently blocking the speaker nudge, leaving Joe on earpiece.
-                        // Turning the watch's Bluetooth off made the nudge fire and Joe
+                        // silently blocking the speaker nudge, leaving the agent on the earpiece.
+                        // Turning the watch's Bluetooth off made the nudge fire and the agent
                         // came up on speaker and HELD there all session — confirming the
                         // watch-in-the-available-list was the sole blocker.
                         //

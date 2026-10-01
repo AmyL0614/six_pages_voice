@@ -395,7 +395,7 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 //                      drive we have ever taken, and there was NO WAY TO KNOW.
 //
 // SPLITS THE REMAINING SPACE IN HALF, AND NOBODY HAS TO SPEAK A WORD IN THE CAR. (Amy
-// cannot: Joe starts immediately and the call dies at 5s. There is no time for a turn.
+// cannot: the agent starts immediately and the call dies at 5s. There is no time for a turn.
 // NO TEST MAY DEPEND ON HER TAKING ONE.)
 //
 //   CASE A -- captureCalls climbing, captureBytes climbing, captureFails=0:
@@ -479,20 +479,20 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 //
 // ── WHAT THIS MEANS IN PRACTICE ────────────────────────────────────────────
 //
-//   - The car's MICROPHONE becomes the input. Joe hears you through the car mic, not
+//   - The car's MICROPHONE becomes the input. The agent hears you through the car mic, not
 //     the iPad's. In a car this is BETTER: the car mic is aimed at the driver; the iPad
 //     is on a seat somewhere. This is what CarPlay does. This is what every hands-free
 //     voice app does. It is the correct trade, not a compromise.
 //   - Automotive HFP mics are 8 kHz. VPIO resamples internally (Build 4 deleted the
 //     AVAudioConverter for exactly this reason), so we still receive 16 kHz frames.
-//     Joe HEARS a telephone-grade mic — same as every hands-free system on earth, and
+//     The agent HEARS a telephone-grade mic — same as every hands-free system on earth, and
 //     what ElevenLabs' STT is built for.
 //   - .allowBluetooth is RESTORED, and .allowBluetoothA2DP is KEPT alongside it. Apple:
 //     when one device offers both, HFP WINS PRIORITY — which is now EXACTLY what we
 //     want. HFP for the car; A2DP still available for an output-only music device.
 //   - VPIO's AEC still owns both ends (car mic in, car speaker out). This is the
 //     configuration VoiceProcessingIO was DESIGNED for. OPEN QUESTION, stated honestly:
-//     AEC quality through a car's HFP loop is unproven for us. If Joe echoes, that is
+//     AEC quality through a car's HFP loop is unproven for us. If the agent echoes, that is
 //     the thing to look at — NOT the routing, which this build is about.
 //
 // ── DIAGNOSTIC FIX (Build 16 was UNREADABLE and that is on the strip's author) ──
@@ -531,8 +531,8 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 //
 // WHAT THE USER ACTUALLY SEES (this is the observation that broke the case open,
 // and it was never written down until now):
-//     Tap Talk -> the CAR'S DASH SHOWS AN INCOMING PHONE CALL. Joe plays through
-//     the car speakers. At ~5 seconds THE CALL ENDS on the dash, and Joe continues,
+//     Tap Talk -> the CAR'S DASH SHOWS AN INCOMING PHONE CALL. The agent plays through
+//     the car speakers. At ~5 seconds THE CALL ENDS on the dash, and the agent continues,
 //     uninterrupted, out of the iPad speaker.
 //
 // The car is not rejecting us. The car HANGS UP ON US. `override>speaker` is the
@@ -569,7 +569,7 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 //
 // So: A2DP OUT (.allowBluetoothA2DP), HFP GONE (.allowBluetooth REMOVED). With no
 // HFP there is NO CALL TO HANG UP. No dash phone icon. Nothing to time out. The car
-// takes Joe as MEDIA — which is what he is — over the stereo A2DP link.
+// takes the agent's audio as MEDIA — which is what it is — over the stereo A2DP link.
 //
 // STILL A REMOVAL, and the cleanest one yet: we are DELETING the request for a phone
 // call we never intended to make.
@@ -582,9 +582,9 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // so the profile did not change. The tin-can sound WAS HFP — 8 kHz mono narrowband —
 // and it was HFP both before and after that deletion.
 //
-// A2DP was ALSO blamed for the chopped/dropped Joe audio. It was not that either.
+// A2DP was ALSO blamed for the chopped/dropped agent audio. It was not that either.
 // The chop was a RING-BUFFER OVERFLOW, proven by arithmetic, in OUR OWN code:
-//     ring 960,000 B + droppedBytes 645,178 B = 1,605,178 B = 50.2 s = ONE JOE TURN.
+//     ring 960,000 B + droppedBytes 645,178 B = 1,605,178 B = 50.2 s = ONE AGENT TURN.
 // Build 11 grew the ring to 180 s and droppedBytes went to ZERO. A2DP is DOWNSTREAM
 // of the ring — it transports audio the render callback has ALREADY drained. It
 // cannot reach back up the pipe and delete bytes. There is no mechanism. The two
@@ -605,7 +605,7 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 //     NO phone-call icon on the dash. NO call to end.
 //     routeAtStart=bluetooth; route=bluetooth; spkDefault=off; policyApplies=0;
 //     droppedBytes=0; NO override>speaker; and the conversation SURVIVES PAST 5s.
-//     Joe should also sound BETTER than he ever has in the car — stereo A2DP
+//     The agent should also sound BETTER than it ever has in the car — stereo A2DP
 //     instead of an 8 kHz call channel.
 //
 // EXPECTED ON A BARE DEVICE (desk): unchanged from Build 15.
@@ -822,30 +822,30 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // A2DP, not the jitter buffer, not echo, not a duplicate feed. It is the oldest and
 // simplest failure in this file, and this repo has now hit it THREE times:
 //
-//   THE RING CANNOT HOLD A WHOLE JOE TURN, SO THE END OF THE TURN IS THROWN AWAY.
+//   THE RING CANNOT HOLD A WHOLE AGENT TURN, SO THE END OF THE TURN IS THROWN AWAY.
 //
-// MEASURED (iPad, July 12, ONE tap of Talk with Claude — confirmed against the
+// MEASURED (iPad, July 12, ONE tap of Talk — confirmed against the
 // ElevenLabs conversation list: 1 conversation, 1m19s, 3 messages, so NO double feed):
-//   droppedBytes = 645178  -> 20.2 s of Joe's audio DELETED before it ever played
+//   droppedBytes = 645178  -> 20.2 s of the agent's audio DELETED before it ever played
 //   ring         = 960000  -> 30.0 s capacity
-//   960000 + 645178 = 1605178 B = 50.2 s = EXACTLY ONE JOE TURN
+//   960000 + 645178 = 1605178 B = 50.2 s = EXACTLY ONE AGENT TURN
 //   underruns=4/3117 (0.13%, healthy).  maxRenderUs=42 vs a 23000 deadline (innocent).
 //   BY EAR: playback stopped DEAD mid-sentence at "It's almost like..." — precisely
 //   where 30 s of buffered audio ran out. Everything after that was already discarded.
 //
 // ElevenLabs ships a turn FASTER THAN REALTIME. The render callback drains at speech
 // rate. So a 50 s turn pours into a 30 s ring in a few seconds; the drop-NEWEST overflow
-// policy discards the excess — and drop-newest means it deletes THE END OF WHAT JOE WAS
+// policy discards the excess — and drop-newest means it deletes THE END OF WHAT THE AGENT WAS
 // ABOUT TO SAY. There is no backpressure: feedPlayback is fire-and-forget by design.
 //
-// WHY IT LOOKED LIKE A REGRESSION AND WASN'T: nothing broke. Joe's replies simply GREW
+// WHY IT LOOKED LIKE A REGRESSION AND WASN'T: nothing broke. The agent's replies simply GREW
 // PAST 30 SECONDS. The July 9 "perfect" conversation had shorter turns that fit. The
 // droppedBytes=0 that was treated as a baseline was never captured on that conversation
 // (the app was closed before reading it) — so the buffer may have been dropping all
 // along, just not enough to hear.
 //
 // FIX: raise the ring to 180 s (5_760_000 B, 5.49 MB). NOT 60 s — the measured turn was
-// already 50 s, and a 60 s ring truncates the next slightly-longer reflection. Joe is a
+// already 50 s, and a 60 s ring truncates the next slightly-longer reflection. This agent is a
 // REFLECTION companion; long considered replies are the PRODUCT, not an edge case.
 // 5.49 MB is trivial on an iPad and is allocated once per session.
 //
@@ -857,7 +857,7 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // ── HARD-WON RULES. READ BEFORE CHANGING ANYTHING IN THIS FILE. ──────────────
 //
 // 1. DIAGNOSTIC READ ORDER: droppedBytes FIRST. >0 means OVERFLOW — the ring is too
-//    small and Joe's later audio is being deleted. That is a COMPLETE explanation of
+//    small and the agent's later audio is being deleted. That is a COMPLETE explanation of
 //    "degrades late in long replies" and "the ending is missing." Look no further.
 //
 // 2. LOW UNDERRUNS + BAD AUDIO = OVERFLOW, NOT STARVATION. This signal has now been
@@ -893,7 +893,7 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 // the whole reason Path 1 (VoiceProcessingIO) was chosen (July 7 lock).
 //
 //   • start        → Layer 2 + installs the input callback; starts drain.
-//   • feedPlayback → writes Joe's bytes into the playback ring buffer (Layer 2).
+//   • feedPlayback → writes the agent's bytes into the playback ring buffer (Layer 2).
 //   • capture      → emits clean 640-byte PCM16 frames.
 //   • stop         → tears down unit, stops drain, clears both ring buffers.
 //
@@ -919,7 +919,7 @@ import Darwin  // Build 6: OSMemoryBarrier (acquire/release fence) for the lock-
 //
 // Android doesn't have this problem because its playback writes straight to an OS
 // AudioTrack (no app-side render callback pulling from a shared ring). iOS can't
-// copy that: Joe's playback MUST pass through the VoiceProcessingIO render callback
+// copy that: the agent's playback MUST pass through the VoiceProcessingIO render callback
 // so the OS can echo-cancel it. So iOS needs a lock-free hand-off to that callback.
 //
 // DESIGN — strict single-producer / single-consumer, lock-free:
@@ -954,7 +954,7 @@ private final class ByteRingBuffer {
 
   // Build 7: total bytes DROPPED because the ring was full when a write arrived
   // (drop-newest overflow). Producer-only writes; read for diagnostics. If this is
-  // > 0 after a turn, the ring filled mid-turn and discarded Joe's later audio —
+  // > 0 after a turn, the ring filled mid-turn and discarded the agent's later audio —
   // the direct measure of "starts great, stumbles mid/late." Plain counter (coarse
   // diagnostic, not correctness-critical).
   private let droppedBytesPtr: UnsafeMutablePointer<Int>
@@ -1209,7 +1209,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // Dart's voiceSendMic() does:  final bool ok = await _voice.start();
   //                              if (!ok) { ...bail... }
   // and then voiceConnectTest() immediately sets _voicePlaybackReady = true and starts
-  // shoving Joe's audio at feedPlayback().
+  // shoving the agent's audio at feedPlayback().
   //
   // That contract is: WHEN start() RESOLVES TRUE, THE ENGINE IS RUNNING.
   //
@@ -1435,13 +1435,13 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // Frame contract (mirrors Android): 640 bytes = 20 ms of 16 kHz mono PCM16.
   private static let frameBytes = 640
 
-  // Playback ring: sized to hold the LONGEST turn Joe can produce, without overflow.
+  // Playback ring: sized to hold the LONGEST turn the agent can produce, without overflow.
   //
   // ElevenLabs synthesizes a whole turn in a few seconds and streams it to us FASTER
   // THAN REALTIME. The render callback drains at natural speech rate (~1 s of audio per
   // 1 s). So the ring must hold an ENTIRE turn — whatever arrives beyond its capacity is
   // discarded by the drop-newest overflow policy, which silently deletes the END of what
-  // Joe was about to say. There is no backpressure to fall back on: feedPlayback is
+  // the agent was about to say. There is no backpressure to fall back on: feedPlayback is
   // fire-and-forget across the method channel, by design.
   //
   // SIZING HISTORY — this has now been raised THREE times, and each time the reason was
@@ -1454,12 +1454,12 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // conversation list, so no duplicate feed):
   //   renderCalls=3117 (~73 s session); droppedBytes=645178 (20.2 s of audio DELETED);
   //   underruns=4 (0.13% — healthy); maxRenderUs=42 (deadline 23000 — callback innocent).
-  //   960000 (held) + 645178 (dropped) = 1605178 B = 50.2 s — EXACTLY one Joe turn.
+  //   960000 (held) + 645178 (dropped) = 1605178 B = 50.2 s — EXACTLY one agent turn.
   //   By ear: playback stopped dead mid-sentence at "It's almost like..." — the point
   //   where 30 s of buffered audio ran out. Everything after it was already discarded.
   //
   // WHY 180 s AND NOT 60 s: the measured turn was already 50 s. A 60 s ring passes that
-  // test with 10 s to spare and truncates the next slightly-longer reflection. Joe is a
+  // test with 10 s to spare and truncates the next slightly-longer reflection. This agent is a
   // REFLECTION companion — long, considered replies are the PRODUCT, not an edge case.
   // 5.49 MB is trivial on an iPad and is allocated ONCE per session, not per turn. This
   // is a place where "too big" costs nothing and "too small" costs a lost conversation.
@@ -1603,7 +1603,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       // BUILD 19b: DO NOT ANSWER result() HERE. See resolveStart() and the comment block
       // on pendingStartResult. Under CallKit the engine does not exist yet at this point
       // -- iOS builds it for us, later, in provider(didActivate:). Answering true now
-      // tells Dart "engine ready" while there is no audio unit, and Dart then feeds Joe
+      // tells Dart "engine ready" while there is no audio unit, and Dart then feeds the agent's audio
       // into nothing. That was the dead button.
       //
       // The FlutterResult is HELD and answered from resolveStart(), called either from
@@ -1734,7 +1734,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
       result(isRunning)
     case "feedPlayback":
       if let typed = call.arguments as? FlutterStandardTypedData {
-        // Build 4: write Joe's raw 16 kHz PCM16 straight to the ring. NO manual
+        // Build 4: write the agent's raw 16 kHz PCM16 straight to the ring. NO manual
         // conversion — the output bus is 16 kHz and VoiceProcessingIO resamples
         // 16k→hardware internally, continuously, with no chunk-boundary seams.
         typed.data.withUnsafeBytes { raw in playback.write(raw) }
@@ -1805,7 +1805,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   // With mode .voiceChat (which VPIO REQUIRES — platform AEC is only enabled in
   // AVAudioSessionModeVoiceChat, and AEC is the entire reason this plugin exists),
   // a bare iPhone with no accessory routes output to the RECEIVER (the earpiece),
-  // not the speaker. Joe would be inaudible unless the phone were held to an ear.
+  // not the speaker. The agent would be inaudible unless the phone were held to an ear.
   // .defaultToSpeaker is what prevents that. The iPad HAS NO EARPIECE, so this bug
   // would have been INVISIBLE on our only test device and would have shipped.
   //
@@ -1929,7 +1929,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   /// FAILURE IS NON-FATAL AND MUST STAY THAT WAY. If setCategory throws mid-session
   /// (it can — a live VPIO unit is not guaranteed to accept a category change), we log,
   /// count it onto the strip, and LEAVE THE EXISTING CATEGORY ALONE. A car that will not
-  /// route is annoying. A conversation that dies is unacceptable. Joe keeps talking no
+  /// route is annoying. A conversation that dies is unacceptable. The agent keeps talking no
   /// matter what the routing does.
   private func applySpeakerPolicy(reason: String) {
     let external = hasExternalOutput()
@@ -1955,7 +1955,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     do {
       // Category only. Mode stays .voiceChat — VPIO requires it for platform AEC.
       // We do NOT deactivate/reactivate the session: the unit is running, the ring is
-      // full of Joe, and tearing the session down mid-turn would lose audio.
+      // full of the agent's audio, and tearing the session down mid-turn would lose audio.
       try AVAudioSession.sharedInstance().setCategory(
         .playAndRecord, mode: .voiceChat, options: options)
       speakerDefaultOn = wanted
@@ -2240,7 +2240,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
   ///
   /// FAILURE IS NON-FATAL. If there is no HFP input, or the set throws, we log it, count
   /// it, and leave the session exactly as it was. A car that will not route is annoying.
-  /// A conversation that dies is unacceptable. Joe keeps talking no matter what.
+  /// A conversation that dies is unacceptable. The agent keeps talking no matter what.
   ///
   /// Preference order matters: .carAudio FIRST (a true car head unit, if the system
   /// enumerates it as one), then .bluetoothHFP (what our test car actually reports),
@@ -2501,7 +2501,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
     // matching HFP port on its own. We never touch the output. That is the whole fix:
     // the HFP call finally has audio flowing UP it, so the car has no reason to hang up.
     //
-    // Non-fatal by construction. If it fails, Joe still talks — out of the iPad.
+    // Non-fatal by construction. If it fails, the agent still talks — out of the iPad.
     selectPreferredInput()
 
     // Where did we BEGIN? route= on the strip is post-hoc and only says where we ENDED.
@@ -2559,7 +2559,7 @@ public class SixPagesVoicePlugin: NSObject, FlutterPlugin {
 
     // ── Build 4: no manual conversion. Record hwRate for diagnostics only. ────
     // The output bus is set to 16 kHz (below); VoiceProcessingIO resamples
-    // 16k→hardware internally. Joe's feed enters the ring as raw 16 kHz bytes.
+    // 16k→hardware internally. The agent's feed enters the ring as raw 16 kHz bytes.
     hwRate = grantedRate
     lastDiagnostics += "playbackPath=VPIO-internal-resample(16k→\(Int(hwRate))Hz); "
 
