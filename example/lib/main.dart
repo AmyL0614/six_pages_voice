@@ -81,7 +81,7 @@ class _VoiceDemoPageState extends State<VoiceDemoPage> {
     });
   }
 
-  // Feeds a short tone through the real playback path (what Joe's PCM uses).
+  // Feeds a short tone through the real playback path (the same path the agent's audio uses).
   Future<void> _playTone() async {
     if (!_running) {
       setState(() => _status = 'Press Start first');

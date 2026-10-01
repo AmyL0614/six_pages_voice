@@ -18,8 +18,10 @@ class SixPagesVoice {
     return SixPagesVoicePlatform.instance.stop();
   }
 
-  /// Pushes Joe's incoming PCM bytes down to native for playback
-  /// through the echo-cancelling unit.
+  /// Pushes the agent's incoming audio (PCM16, 16 kHz, mono) down to native
+  /// for playback through the echo-cancelling unit. Returns as soon as the
+  /// bytes are queued; it never waits for them to play, so the calling thread
+  /// is never blocked while the agent speaks.
   Future<void> feedPlayback(Uint8List pcm) {
     return SixPagesVoicePlatform.instance.feedPlayback(pcm);
   }
@@ -45,7 +47,8 @@ class SixPagesVoice {
   }
 
   /// The clean, echo-free capture stream (PCM16, 16 kHz, mono) coming up
-  /// from native. Feed this to VAD's audioStream.
+  /// from native. Send it wherever your app needs the user's voice, for
+  /// example as the user audio of an ElevenLabs conversation.
   Stream<Uint8List> get captureStream {
     return SixPagesVoicePlatform.instance.captureStream;
   }
