@@ -3,6 +3,16 @@
 All notable changes to this plugin. Dates are when the change reached `main`.
 Pin a full commit SHA in your `pubspec.yaml` (see the README's Install section).
 
+## Unreleased
+
+### Added
+- CI: an Android compile check that builds the example app with AGP 8.11.1
+  and the Kotlin Gradle Plugin, with AGP 9.0.1 and the Kotlin Gradle Plugin,
+  and with AGP 9.0.1 and built-in Kotlin. All three pass. No plugin code
+  changed: the plugin already applies the Kotlin Gradle Plugin only below
+  AGP 9.
+- README: a Build compatibility section listing the tested setups.
+
 ## 0.2.0 - 2026-10-01
 
 ### Added

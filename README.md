@@ -110,6 +110,17 @@ The far-end signal is fed back into the canceller, which is why the AI does not 
 
 **16 KB memory pages.** The AEC3 native library is linked with 16 KB ELF alignment, so it loads on devices that use a 16 KB page size and meets Google Play's 16 KB requirement for apps targeting Android 15 (API 35) and up. See [Android setup](#android-setup) for how.
 
+**Build compatibility.** Both platforms have compile checks in CI (Codemagic, `codemagic.yaml` in this repository), run before changes are released. As of October 2026 the plugin builds in all of these setups:
+
+| Platform | Setup | Result |
+|---|---|---|
+| Android | AGP 8.11.1, Kotlin Gradle Plugin 2.2.20, Gradle 8.14 | Builds |
+| Android | AGP 9.0.1, Gradle 9.1.0, `android.builtInKotlin=false` | Builds |
+| Android | AGP 9.0.1, Gradle 9.1.0, `android.builtInKotlin=true` (built-in Kotlin) | Builds |
+| iOS | Flutter 3.47.7, debug build, no code signing | Builds |
+
+The plugin applies the Kotlin Gradle Plugin only when AGP is older than 9, so it is ready for Flutter's move to built-in Kotlin ([migration guide](https://docs.flutter.dev/release/breaking-changes/migrate-to-built-in-kotlin)). These are the setups that have been tested. Older Flutter, AGP or Kotlin versions may work, but have not been checked.
+
 ---
 
 ## Install
