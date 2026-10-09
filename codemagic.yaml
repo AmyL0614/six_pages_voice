@@ -48,3 +48,147 @@ workflows:
       # (the "prove the right thing appeared" standard, not just "no error").
       - example/build/ios/iphoneos/*.app
       - /tmp/xcodebuild_logs/*.log
+
+  # -------------------------------------------------------------------------
+  # Android compile check: the built-in Kotlin migration (Flutter 3.44+).
+  #
+  # Why this exists: Flutter will, in a future version, stop supporting the
+  # Kotlin Gradle Plugin (KGP) on AGP 9+ and require built-in Kotlin
+  # (Flutter breaking-change "Migrate to built-in Kotlin"; issue #184837).
+  # The plugin's build.gradle.kts already applies KGP only when AGP < 9.
+  # This workflow PROVES that on a real toolchain instead of assuming it.
+  #
+  # It builds the example app three ways, in one run:
+  #   A  FlutterFlow today : AGP 8.11.1, KGP 2.2.20, Gradle 8.14,
+  #                          builtInKotlin=false, newDsl=false
+  #                          (matches the Six Pages export of Oct 9, 2026).
+  #                          This is the CONTROL: the shipped app builds this
+  #                          way, so if A fails the check is broken, not the
+  #                          plugin.
+  #   B  Middle step       : AGP 9.0.1, Gradle 9.1.0, builtInKotlin=false
+  #                          (the example app exactly as committed).
+  #   C  The future        : AGP 9.0.1, Gradle 9.1.0, builtInKotlin=true
+  #                          (the test the plugin-author migration guide
+  #                          prescribes).
+  #
+  # Nothing is committed. Each variant edits the example's Gradle files on
+  # the build machine only, and the next variant starts from a clean
+  # `git checkout`. Every variant runs even if an earlier one fails; the last
+  # step prints PASS/FAIL per variant and fails the build if any failed.
+  #
+  # Debug, arm64 only, no signing: this proves COMPILE, like the iOS check.
+  # Runs on the M2 so it uses the free macOS minutes.
+  # -------------------------------------------------------------------------
+  android-kotlin-compile-check:
+    name: Android compile check (built-in Kotlin, 3 setups)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: stable
+    scripts:
+      - name: Flutter version (for the log)
+        script: |
+          flutter --version
+          java -version
+
+      - name: Install the NDK the plugin pins (r27, 27.0.12077973)
+        # The image ships NDK 27.3, not 27.0.12077973, which build.gradle.kts
+        # pins to match the committed AEC3 prebuilt. CMake 3.22.1 is
+        # preinstalled. Installing explicitly keeps an NDK download from
+        # being mistaken for a Kotlin failure.
+        script: |
+          set -e
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/share/android-sdk}"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "ndk;27.0.12077973" > /dev/null
+          ls "$SDK/ndk"
+
+      - name: Get plugin + example dependencies
+        script: |
+          set -e
+          cd example
+          flutter pub get
+
+      - name: Prepare the variant runner
+        # Writes a small helper to /tmp (not the repo). Each variant step
+        # sources it. Edits use perl so they behave the same on macOS.
+        script: |
+          cat > /tmp/variant.sh <<'EOF'
+          # usage: run_variant NAME AGP KGP GRADLE BUILTIN NEWDSL APP_APPLIES_KGP
+          run_variant() {
+            NAME="$1"; AGP="$2"; KGP="$3"; GRADLE="$4"
+            BUILTIN="$5"; NEWDSL="$6"; APP_KGP="$7"
+            mkdir -p /tmp/android_logs
+            LOG="/tmp/android_logs/$NAME.log"
+            cd "$CM_BUILD_DIR"
+            git checkout -- example/android
+            rm -rf example/build example/android/.gradle
+            A=example/android
+            perl -pi -e 's/(id\("com\.android\.application"\) version ")[^"]*"/${1}'"$AGP"'"/' $A/settings.gradle.kts
+            perl -pi -e 's/(id\("org\.jetbrains\.kotlin\.android"\) version ")[^"]*"/${1}'"$KGP"'"/' $A/settings.gradle.kts
+            perl -pi -e 's#gradle-[0-9.]+-all\.zip#gradle-'"$GRADLE"'-all.zip#' $A/gradle/wrapper/gradle-wrapper.properties
+            perl -pi -e 's/^android\.builtInKotlin=.*/android.builtInKotlin='"$BUILTIN"'/' $A/gradle.properties
+            perl -pi -e 's/^android\.newDsl=.*/android.newDsl='"$NEWDSL"'/' $A/gradle.properties
+            if [ "$APP_KGP" = "yes" ]; then
+              # AGP < 9 compiles no Kotlin by itself, so the app must apply
+              # KGP, as the FlutterFlow-generated app does.
+              perl -0pi -e 's/(id\("com\.android\.application"\)\n)/${1}    id("org.jetbrains.kotlin.android")\n/' $A/app/build.gradle.kts
+            fi
+            {
+              echo "=== Variant $NAME ==="
+              echo "--- settings.gradle.kts plugins"; grep -n 'id("' $A/settings.gradle.kts
+              echo "--- app plugins"; sed -n '1,6p' $A/app/build.gradle.kts
+              echo "--- wrapper"; grep distributionUrl $A/gradle/wrapper/gradle-wrapper.properties
+              echo "--- gradle.properties"; grep '^android\.' $A/gradle.properties
+            } | tee "$LOG"
+            set +e
+            ( cd example && flutter build apk --debug --target-platform android-arm64 ) 2>&1 | tee -a "$LOG"
+            RC=${PIPESTATUS[0]}
+            set -e
+            if [ "$RC" -eq 0 ] && ls example/build/app/outputs/flutter-apk/*.apk >/dev/null 2>&1; then
+              echo "PASS" > "/tmp/android_logs/$NAME.result"
+              unzip -l example/build/app/outputs/flutter-apk/app-debug.apk | grep -E "lib/arm64-v8a/.*\.so" | tee -a "$LOG" || true
+            else
+              echo "FAIL (exit $RC)" > "/tmp/android_logs/$NAME.result"
+            fi
+            echo "Variant $NAME: $(cat /tmp/android_logs/$NAME.result)"
+          }
+          EOF
+          echo "runner written"
+
+      - name: "A: FlutterFlow today (AGP 8.11.1, KGP on)"
+        ignore_failure: true
+        script: |
+          #!/usr/bin/env bash
+          source /tmp/variant.sh
+          run_variant A_flutterflow_today 8.11.1 2.2.20 8.14 false false yes
+
+      - name: "B: Middle step (AGP 9, builtInKotlin=false)"
+        ignore_failure: true
+        script: |
+          #!/usr/bin/env bash
+          source /tmp/variant.sh
+          run_variant B_agp9_kgp 9.0.1 2.3.20 9.1.0 false false no
+
+      - name: "C: The future (AGP 9, builtInKotlin=true)"
+        ignore_failure: true
+        script: |
+          #!/usr/bin/env bash
+          source /tmp/variant.sh
+          run_variant C_agp9_builtin 9.0.1 2.3.20 9.1.0 true false no
+
+      - name: Summary
+        script: |
+          echo "Android compile check, built-in Kotlin migration"
+          FAILED=0
+          for V in A_flutterflow_today B_agp9_kgp C_agp9_builtin; do
+            R=$(cat "/tmp/android_logs/$V.result" 2>/dev/null || echo "DID NOT RUN")
+            echo "  $V : $R"
+            case "$R" in PASS) ;; *) FAILED=1 ;; esac
+          done
+          cd "$CM_BUILD_DIR" && git checkout -- example/android
+          exit $FAILED
+    artifacts:
+      - /tmp/android_logs/*.log
+      - /tmp/android_logs/*.result
